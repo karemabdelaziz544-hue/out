@@ -37,7 +37,7 @@ export async function adminStartAcidProcessingAction(
   formData: FormData,
 ): Promise<AcidActionResult> {
   try {
-    const adminUser = await requireRole(["admin", "manager"]);
+    const adminUser = await requireRole(["admin"]);
     const shipmentId = formData.get("shipment_id") as string;
     const notesRaw = formData.get("notes") as string | null;
 
@@ -172,7 +172,7 @@ export async function adminIssueAcidAction(
   formData: FormData,
 ): Promise<AcidActionResult> {
   try {
-    const adminUser = await requireRole(["admin", "manager"]);
+    const adminUser = await requireRole(["admin"]);
     const shipmentId = formData.get("shipment_id") as string;
     const acidNumberRaw = formData.get("acid_number") as string;
     const notesRaw = formData.get("notes") as string | null;
@@ -379,7 +379,7 @@ export async function adminFailAcidAction(
   formData: FormData,
 ): Promise<AcidActionResult> {
   try {
-    const adminUser = await requireRole(["admin", "manager"]);
+    const adminUser = await requireRole(["admin"]);
     const shipmentId = formData.get("shipment_id") as string;
     const reasonRaw = formData.get("reason") as string;
 

@@ -27,8 +27,8 @@ export async function recordExternalOperationAction(
   formData: FormData,
 ): Promise<CreateExternalOperationActionResult> {
   try {
-    // 1. Role Authorization: Internal staff only
-    await requireRole(["admin", "manager", "data_entry", "inspector"]);
+    // 1. Role Authorization: Internal operational staff only (manager is read-only)
+    await requireRole(["admin", "data_entry", "inspector"]);
     const currentUser = await getCurrentUser();
 
     if (!currentUser) {

@@ -43,6 +43,7 @@ const SHIPMENT_B_ID = "22222222-2222-4222-8222-222222222222";
 const COMPANY_A_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const COMPANY_B_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const DOC_RECEIPT_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+const DOC_SHIPMENT_B_ID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
 
 const ACTORS: Record<string, VerifiedFinancialActor> = {
   admin: {
@@ -123,12 +124,15 @@ function createStatefulMockSupabase(options?: {
   pricingStatus?: "customer_approved" | "proposed";
   pricingApprovalType?: "final_fixed" | "estimated_range";
   finalPrice?: number | null;
+  includePrerequisites?: boolean;
 }) {
   let idSeq = 1;
   const nextUuid = () => {
     const hex = String(idSeq++).padStart(12, "0");
     return `77777777-7777-4777-8777-${hex}`;
   };
+
+  const includePrereqs = options?.includePrerequisites !== false;
 
   const shipments = [
     {
@@ -165,31 +169,120 @@ function createStatefulMockSupabase(options?: {
       document_type: "customs_receipt",
       status: "approved",
     },
+    {
+      id: DOC_SHIPMENT_B_ID,
+      shipment_id: SHIPMENT_B_ID,
+      document_type: "customs_receipt",
+      status: "approved",
+    },
+    ...(includePrereqs
+      ? [
+          {
+            id: "d1111111-1111-4111-8111-111111111101",
+            shipment_id: SHIPMENT_A_ID,
+            document_type: "commercial_invoice",
+            status: "approved",
+          },
+          {
+            id: "d1111111-1111-4111-8111-111111111102",
+            shipment_id: SHIPMENT_A_ID,
+            document_type: "packing_list",
+            status: "approved",
+          },
+          {
+            id: "d1111111-1111-4111-8111-111111111103",
+            shipment_id: SHIPMENT_A_ID,
+            document_type: "bill_of_lading",
+            status: "approved",
+          },
+          {
+            id: "d1111111-1111-4111-8111-111111111104",
+            shipment_id: SHIPMENT_A_ID,
+            document_type: "certificate_of_origin",
+            status: "approved",
+          },
+        ]
+      : []),
   ];
 
   const obligations: ShipmentCustomsObligationRow[] = [];
   const transactions: ShipmentFinancialTransactionRow[] = [];
   const internalNotes: ShipmentFinancialInternalNoteRow[] = [];
-  const stages = new Map<
-    string,
-    {
-      id: string;
-      shipment_id: string;
-      stage_key: string;
-      status: string;
-      stage_data: Record<string, unknown>;
-      reference_number: string | null;
-      completed_at: string | null;
-      completed_by: string | null;
-    }
-  >([
+  const regulatoryProcedures: Array<Record<string, unknown>> = [];
+
+  type StageRow = {
+    id: string;
+    shipment_id: string;
+    stage_key: string;
+    stage_order: number;
+    status: string;
+    is_applicable: boolean;
+    stage_data: Record<string, unknown>;
+    reference_number: string | null;
+    completed_at: string | null;
+    completed_by: string | null;
+  };
+
+  const completedStages: Array<[string, StageRow]> = includePrereqs
+    ? (
+        [
+          ["stage_1_intake", 1, null, {}],
+          ["stage_2_pricing", 2, null, {}],
+          ["stage_3_nafeza_acid", 3, "ACID-2026-001", {}],
+          [
+            "stage_4_form_46",
+            4,
+            "F46-2026-001",
+            { form_46_number: "F46-2026-001", form_46_extracted: true },
+          ],
+          ["stage_5_scouting", 5, null, {}],
+          ["stage_6_inspection", 6, null, {}],
+          ["stage_7_data_entry", 8, null, {}],
+          ["stage_8_valuation", 9, "VAL-2026-001", {}],
+        ] as Array<[string, number, string | null, Record<string, unknown>]>
+      ).map(([key, order, ref, data]) => [
+        `${SHIPMENT_A_ID}:${key}`,
+        {
+          id: `88888888-8888-4888-8888-${String(order).padStart(12, "0")}`,
+          shipment_id: SHIPMENT_A_ID,
+          stage_key: key,
+          stage_order: order,
+          status: "completed",
+          is_applicable: true,
+          stage_data: data,
+          reference_number: ref,
+          completed_at: "2026-01-01T00:00:00.000Z",
+          completed_by: ACTORS.admin.id,
+        },
+      ])
+    : [];
+
+  const stages = new Map<string, StageRow>([
+    ...completedStages,
+    [
+      `${SHIPMENT_A_ID}:stage_4_type_procedures`,
+      {
+        id: "88888888-8888-4888-8888-000000000007",
+        shipment_id: SHIPMENT_A_ID,
+        stage_key: "stage_4_type_procedures",
+        stage_order: 7,
+        status: "skipped",
+        is_applicable: false,
+        stage_data: {},
+        reference_number: null,
+        completed_at: null,
+        completed_by: null,
+      },
+    ],
     [
       `${SHIPMENT_A_ID}:stage_9_fees_payments`,
       {
         id: "88888888-8888-4888-8888-000000000009",
         shipment_id: SHIPMENT_A_ID,
         stage_key: "stage_9_fees_payments",
+        stage_order: 10,
         status: "in_progress",
+        is_applicable: true,
         stage_data: {},
         reference_number: null,
         completed_at: null,
@@ -253,6 +346,8 @@ function createStatefulMockSupabase(options?: {
           return internalNotes as unknown as Array<Record<string, unknown>>;
         case "shipment_customs_stages":
           return Array.from(stages.values()) as unknown as Array<Record<string, unknown>>;
+        case "shipment_regulatory_procedures":
+          return regulatoryProcedures;
         case "shipment_financial_migration_audit_v":
           return [];
         default:
@@ -288,6 +383,10 @@ function createStatefulMockSupabase(options?: {
         filters.push((r) => r[col] !== val);
         return builder;
       },
+      in(col: string, vals: unknown[]) {
+        filters.push((r) => vals.includes(r[col]));
+        return builder;
+      },
       order() {
         return builder;
       },
@@ -298,7 +397,7 @@ function createStatefulMockSupabase(options?: {
       async single() {
         const rows = executePendingUpdateIfNeeded();
         if (!rows[0]) {
-          return { data: null, error: { message: "Row not found" } };
+          return { data: null, error: { code: "PGRST116", message: "Row not found" } };
         }
         return { data: rows[0], error: null };
       },
@@ -311,6 +410,33 @@ function createStatefulMockSupabase(options?: {
         return Promise.resolve({ data: rows, error: null }).then(onFulfilled, onRejected);
       },
       insert(payload: Record<string, unknown>) {
+        if (table === "shipment_financial_transactions") {
+          const duplicateIdem = transactions.find(
+            (t) =>
+              t.shipment_id === payload.shipment_id &&
+              t.idempotency_key === payload.idempotency_key,
+          );
+          if (duplicateIdem) {
+            const dbErr = {
+              code: "23505",
+              message:
+                'duplicate key value violates unique constraint "idx_uq_financial_tx_idempotency"',
+            };
+            return {
+              select() {
+                return {
+                  async single() {
+                    return { data: null, error: dbErr };
+                  },
+                };
+              },
+              then(onFulfilled?: (val: { data: null; error: typeof dbErr }) => unknown) {
+                return Promise.resolve({ data: null, error: dbErr }).then(onFulfilled);
+              },
+            };
+          }
+        }
+
         const nowIso = new Date().toISOString();
         const newRow: Record<string, unknown> = {
           id: nextUuid(),
@@ -362,7 +488,12 @@ function createStatefulMockSupabase(options?: {
             id: existing?.id ?? nextUuid(),
             shipment_id: String(payload.shipment_id),
             stage_key: String(payload.stage_key),
+            stage_order: Number(payload.stage_order ?? existing?.stage_order ?? 10),
             status: String(payload.status),
+            is_applicable:
+              typeof payload.is_applicable === "boolean"
+                ? payload.is_applicable
+                : existing?.is_applicable ?? true,
             stage_data: (payload.stage_data as Record<string, unknown>) || {},
             reference_number: (payload.reference_number as string | null) ?? null,
             completed_at: (payload.completed_at as string | null) ?? null,
@@ -664,7 +795,25 @@ describe("Phase 2 / Step 3 — Financial Server Actions, Queries, Security & Gat
     );
     assert.equal(tx1.success, true);
 
-    // Duplicate submission with the same idempotency_key is rejected
+    // Duplicate submission with the same idempotency_key AND identical payload returns idempotent success
+    const retryIdentical = await recordOutDisbursementAction(
+      {
+        shipment_id: SHIPMENT_A_ID,
+        entry_type: "customs_duties",
+        customs_obligation_id: obligationId,
+        amount: "25000.00",
+        is_billable_to_customer: true,
+        payment_method: "bank_transfer",
+        reference_number: "BNK-300-1",
+        idempotency_key: "idem-300-1",
+      },
+      { supabase, actor: ACTORS.admin },
+    );
+    assert.equal(retryIdentical.success, true);
+    assert.equal(retryIdentical.data?.id, tx1.data?.id);
+    assert.equal(supabase._state.transactions.length, 1);
+
+    // Duplicate submission with the same idempotency_key and DIFFERENT payload is rejected
     const dupIdem = await recordOutDisbursementAction(
       {
         shipment_id: SHIPMENT_A_ID,
@@ -888,6 +1037,41 @@ describe("Phase 2 / Step 3 — Financial Server Actions, Queries, Security & Gat
       supabase._state.stages.get(`${SHIPMENT_A_ID}:stage_9_fees_payments`)?.status,
       "completed",
     );
+    assert.equal(
+      supabase._state.stages.get(`${SHIPMENT_A_ID}:stage_10_clearance_release`)?.status,
+      "in_progress",
+    );
+
+    // Retrying customer direct payment after verification with identical payload returns idempotent success
+    const directRetryAfterVerify = await recordCustomerDirectCustomsPaymentAction(
+      {
+        shipment_id: SHIPMENT_A_ID,
+        customs_obligation_id: obligationId,
+        amount: "50000.00",
+        payment_method: "nafeza_epay",
+        reference_number: "DIRECT-NFZ-400",
+        idempotency_key: "idem-direct-400",
+      },
+      { supabase, actor: ACTORS.admin },
+    );
+    assert.equal(directRetryAfterVerify.success, true);
+    assert.equal(directRetryAfterVerify.data?.id, directPendingRes.data!.id);
+    assert.equal(directRetryAfterVerify.data?.entry_status, "posted");
+
+    // Reusing the same idempotency_key with a DIFFERENT payload is still rejected
+    const directConflictRetry = await recordCustomerDirectCustomsPaymentAction(
+      {
+        shipment_id: SHIPMENT_A_ID,
+        customs_obligation_id: obligationId,
+        amount: "50000.00",
+        payment_method: "nafeza_epay",
+        reference_number: "DIRECT-NFZ-CONFLICT",
+        idempotency_key: "idem-direct-400",
+      },
+      { supabase, actor: ACTORS.admin },
+    );
+    assert.equal(directConflictRetry.success, false);
+    assert.equal(directConflictRetry.code, "DUPLICATE_TRANSACTION");
 
     // 9. Reverse the 5,000 EGP payment -> atomically marks original reversed, reopens balance to 5,000 EGP, and reopens Stage 9 to 'in_progress'!
     const reversalRes = await reverseFinancialTransactionAction(
@@ -962,5 +1146,254 @@ describe("Phase 2 / Step 3 — Financial Server Actions, Queries, Security & Gat
     );
     assert.equal(rejectPosted.success, false);
     assert.equal(rejectPosted.code, "VALIDATION_ERROR");
+  });
+
+  it("5. Step 2 Hardening: Stage 9 Prerequisite Gate, Reversal Idempotency, Concurrent Races & Cross-Shipment Attachment Guards", async () => {
+    // A. Stage 9 cannot complete if earlier stages (Form 46 / Valuation) & docs are incomplete
+    const unreadySupabase = createStatefulMockSupabase({ includePrerequisites: false });
+    const obUnready = await createCustomsObligationAction(
+      {
+        shipment_id: SHIPMENT_A_ID,
+        claim_type: "primary_assessment",
+        customs_claim_number: "CLM-500-UNREADY",
+        assessed_amount: "10000.00",
+      },
+      { supabase: unreadySupabase, actor: ACTORS.admin },
+    );
+    assert.equal(obUnready.success, true);
+
+    const payCustoms = await recordOutDisbursementAction(
+      {
+        shipment_id: SHIPMENT_A_ID,
+        entry_type: "customs_duties",
+        customs_obligation_id: obUnready.data!.id,
+        amount: "10000.00",
+        is_billable_to_customer: true,
+        payment_method: "bank_transfer",
+        reference_number: "BNK-500-C",
+        idempotency_key: "idem-500-c",
+      },
+      { supabase: unreadySupabase, actor: ACTORS.admin },
+    );
+    assert.equal(payCustoms.success, true);
+
+    const collectAll = await recordCustomerPaymentToOutAction(
+      {
+        shipment_id: SHIPMENT_A_ID,
+        entry_type: "final_settlement",
+        amount: "18000.00",
+        payment_method: "bank_transfer",
+        reference_number: "BNK-500-ALL",
+        idempotency_key: "idem-500-all",
+      },
+      { supabase: unreadySupabase, actor: ACTORS.admin },
+    );
+    assert.equal(collectAll.success, true);
+
+    const blockedWithoutPrereqs = await completeStage9FinancialSettlementAction(
+      { shipment_id: SHIPMENT_A_ID },
+      { supabase: unreadySupabase, actor: ACTORS.admin },
+    );
+    assert.equal(blockedWithoutPrereqs.success, false);
+    assert.equal(blockedWithoutPrereqs.code, "VALIDATION_ERROR");
+
+    // B. Cross-shipment attachment_document_id & internal note transaction_id guards
+    const supabase = createStatefulMockSupabase();
+    const obRes = await createCustomsObligationAction(
+      {
+        shipment_id: SHIPMENT_A_ID,
+        claim_type: "primary_assessment",
+        customs_claim_number: "CLM-500-SEC",
+        assessed_amount: "20000.00",
+      },
+      { supabase, actor: ACTORS.admin },
+    );
+    assert.equal(obRes.success, true);
+
+    const crossShipmentAttachment = await recordOutDisbursementAction(
+      {
+        shipment_id: SHIPMENT_A_ID,
+        entry_type: "customs_duties",
+        customs_obligation_id: obRes.data!.id,
+        amount: "20000.00",
+        is_billable_to_customer: true,
+        payment_method: "bank_transfer",
+        reference_number: "BNK-CROSS-DOC",
+        attachment_document_id: DOC_SHIPMENT_B_ID,
+        idempotency_key: "idem-cross-doc",
+      },
+      { supabase, actor: ACTORS.admin },
+    );
+    assert.equal(crossShipmentAttachment.success, false);
+    assert.equal(crossShipmentAttachment.code, "VALIDATION_ERROR");
+
+    // Seed a transaction on SHIPMENT_B and try linking an internal note from SHIPMENT_A
+    const txShipmentB = await recordCustomerChargeOrCreditAction(
+      {
+        shipment_id: SHIPMENT_B_ID,
+        entry_category: "customer_charge",
+        entry_type: "documentation_fee",
+        amount: "500.00",
+        description: "رسوم إضافية شحنة ب",
+        idempotency_key: "idem-ship-b-charge",
+      },
+      { supabase, actor: ACTORS.admin },
+    );
+    assert.equal(txShipmentB.success, true);
+
+    const crossNote = await addFinancialInternalNoteAction(
+      {
+        shipment_id: SHIPMENT_A_ID,
+        transaction_id: txShipmentB.data!.id,
+        note: "ملاحظة عبر الشحنات غير مصرح بها",
+      },
+      { supabase, actor: ACTORS.admin },
+    );
+    assert.equal(crossNote.success, false);
+    assert.equal(crossNote.code, "VALIDATION_ERROR");
+
+    // C. Reversal idempotency (identical returns success; conflicting reason fails)
+    const retryCharge = await recordCustomerChargeOrCreditAction(
+      {
+        shipment_id: SHIPMENT_B_ID,
+        entry_category: "customer_charge",
+        entry_type: "documentation_fee",
+        amount: "500.00",
+        description: "رسوم إضافية شحنة ب",
+        idempotency_key: "idem-ship-b-charge",
+      },
+      { supabase, actor: ACTORS.admin },
+    );
+    assert.equal(retryCharge.success, true);
+    assert.equal(retryCharge.data?.id, txShipmentB.data!.id);
+
+    const rev1 = await reverseFinancialTransactionAction(
+      {
+        transaction_id: txShipmentB.data!.id,
+        shipment_id: SHIPMENT_B_ID,
+        reversal_reason: "إلغاء رسم مضاف بالخطأ",
+        idempotency_key: "idem-rev-500",
+      },
+      { supabase, actor: ACTORS.admin },
+    );
+    assert.equal(rev1.success, true);
+
+    const revIdenticalRetry = await reverseFinancialTransactionAction(
+      {
+        transaction_id: txShipmentB.data!.id,
+        shipment_id: SHIPMENT_B_ID,
+        reversal_reason: "إلغاء رسم مضاف بالخطأ",
+        idempotency_key: "idem-rev-500",
+      },
+      { supabase, actor: ACTORS.admin },
+    );
+    assert.equal(revIdenticalRetry.success, true);
+    assert.equal(revIdenticalRetry.data?.id, rev1.data!.id);
+
+    const revConflictingRetry = await reverseFinancialTransactionAction(
+      {
+        transaction_id: txShipmentB.data!.id,
+        shipment_id: SHIPMENT_B_ID,
+        reversal_reason: "سبب عكس مختلف تماماً",
+        idempotency_key: "idem-rev-500",
+      },
+      { supabase, actor: ACTORS.admin },
+    );
+    assert.equal(revConflictingRetry.success, false);
+    assert.equal(revConflictingRetry.code, "DUPLICATE_TRANSACTION");
+
+    // D. Concurrent verify / reject transition guard (0-row update without PGRST116 error)
+    const pendingDirect = await recordCustomerDirectCustomsPaymentAction(
+      {
+        shipment_id: SHIPMENT_A_ID,
+        customs_obligation_id: obRes.data!.id,
+        amount: "15000.00",
+        payment_method: "nafeza_epay",
+        reference_number: "NAF-RACE-01",
+        idempotency_key: "idem-direct-race-01",
+      },
+      { supabase, actor: ACTORS.admin },
+    );
+    assert.equal(pendingDirect.success, true);
+
+    const raceVerifySupabase = {
+      ...supabase,
+      from(table: string) {
+        const qb = supabase.from(table);
+        if (table !== "shipment_financial_transactions") return qb;
+        let sawInitialSelect = false;
+        const origSelect = qb.select.bind(qb);
+        qb.select = (...args: unknown[]) => {
+          const res = origSelect(...args);
+          sawInitialSelect = true;
+          return res;
+        };
+        const origUpdate = qb.update.bind(qb);
+        qb.update = (payload: Record<string, unknown>) => {
+          // Simulate another admin winning the verification race right before UPDATE executes
+          if (sawInitialSelect && payload.entry_status === "posted") {
+            const target = supabase._state.transactions.find(
+              (t) => t.id === pendingDirect.data!.id,
+            );
+            if (target) {
+              target.entry_status = "posted";
+              target.customer_visible = true;
+            }
+          }
+          return origUpdate(payload);
+        };
+        return qb;
+      },
+    };
+
+    const racedVerify = await verifyCustomerDirectCustomsPaymentAction(
+      {
+        transaction_id: pendingDirect.data!.id,
+        shipment_id: SHIPMENT_A_ID,
+        attachment_document_id: DOC_RECEIPT_ID,
+      },
+      { supabase: raceVerifySupabase, actor: ACTORS.admin },
+    );
+    assert.equal(racedVerify.success, true);
+    assert.equal(racedVerify.data?.entry_status, "posted");
+
+    // E. Concurrent 23505 insert collision recovery on idempotency_key
+    let skipFirstIdemLookup = true;
+    const raceInsertSupabase = {
+      ...supabase,
+      from(table: string) {
+        const qb = supabase.from(table);
+        if (table !== "shipment_financial_transactions") return qb;
+        let isIdemLookup = false;
+        const origEq = qb.eq.bind(qb);
+        qb.eq = (col: string, val: unknown) => {
+          if (col === "idempotency_key") isIdemLookup = true;
+          return origEq(col, val);
+        };
+        const origMaybeSingle = qb.maybeSingle.bind(qb);
+        qb.maybeSingle = async () => {
+          if (isIdemLookup && skipFirstIdemLookup) {
+            skipFirstIdemLookup = false;
+            return { data: null, error: null };
+          }
+          return origMaybeSingle();
+        };
+        return qb;
+      },
+    };
+
+    const racedChargeRecover = await recordCustomerChargeOrCreditAction(
+      {
+        shipment_id: SHIPMENT_B_ID,
+        entry_category: "customer_charge",
+        entry_type: "documentation_fee",
+        amount: "500.00",
+        description: "رسوم إضافية شحنة ب",
+        idempotency_key: "idem-ship-b-charge",
+      },
+      { supabase: raceInsertSupabase, actor: ACTORS.admin },
+    );
+    assert.equal(racedChargeRecover.success, true);
+    assert.equal(racedChargeRecover.data?.id, txShipmentB.data!.id);
   });
 });

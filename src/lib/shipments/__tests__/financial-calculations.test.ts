@@ -13,6 +13,9 @@ import {
   toPiastres,
   validateFinancialTransactionInput,
 } from "../financial-calculations";
+import { buildAuthoritativeTenStageJourney } from "../canonical-journey-adapter";
+import type { Shipment } from "../../../types";
+import type { ShipmentCustomsJourney } from "../../../types/journey";
 import type {
   ShipmentCustomsObligationRow,
   ShipmentFinancialTransactionRow,
@@ -587,6 +590,89 @@ describe("Phase 2 / Step 2 — Financial Calculations & Ledger Invariants", () =
         idempotency_key: "idem-dir-1",
       });
       assert.equal(invalidDirectBillable.valid, false);
+    });
+
+    it("blocks negative total_customer_receivable_to_out in evaluateStage9FinancialGate and prevents Stage 9/10 adapter bypass", () => {
+      const negativeReceivableGate = evaluateStage9FinancialGate({
+        has_confirmed_final_price: true,
+        assessed_customs_obligation: 10000,
+        pending_direct_customs_payments: 0,
+        is_customs_coverage_complete: true,
+        total_customer_receivable_to_out: -200,
+        outstanding_balance_to_out: 0,
+      });
+
+      assert.equal(negativeReceivableGate.canComplete, false);
+      assert.equal(negativeReceivableGate.isOutReceivableSettled, false);
+      assert.equal(
+        negativeReceivableGate.blockingReasons.some(
+          (r) => r.code === "overpayment_unsettled",
+        ),
+        true,
+      );
+
+      const mockShipment: Shipment = {
+        id: SHIPMENT_ID,
+        reference_number: "SHP-GATE-TEST",
+        customer_id: "cust-1",
+        company_id: "comp-1",
+        status: "customs_cleared",
+        supplier_name: "Test Supplier",
+        country_of_origin: "China",
+        port_of_arrival: "Alexandria",
+        goods_description: "Industrial Machinery",
+        packages_count: 10,
+        package_type: "Pallet",
+        gross_weight: 2500,
+        notes: null,
+        goods_category: "industrial",
+        applicable_procedures: [],
+        created_at: "2026-01-01T00:00:00.000Z",
+        updated_at: "2026-01-01T00:00:00.000Z",
+      };
+
+      const unclosedStage9Journey = {
+        shipmentId: SHIPMENT_ID,
+        stages: [
+          { stage_key: "stage_9_fees_payments", stage_order: 10, status: "in_progress", is_applicable: true, stage_data: {} },
+          { stage_key: "stage_10_clearance_release", stage_order: 11, status: "in_progress", is_applicable: true, stage_data: {} },
+        ],
+      } as unknown as ShipmentCustomsJourney;
+
+      const summary = calculateShipmentFinancialSummary({
+        shipmentId: SHIPMENT_ID,
+        obligations: [makeObligation({ assessed_amount: "10000.00" })],
+        transactions: [],
+        pricing: { status: "customer_approved", approval_type: "final_fixed", final_price: 5000 },
+      });
+
+      const adapted = buildAuthoritativeTenStageJourney({
+        shipment: mockShipment,
+        journey: unclosedStage9Journey,
+        financialSummary: summary,
+        pricing: {
+          id: "pr-1",
+          shipment_id: SHIPMENT_ID,
+          estimated_min_price: 4000,
+          estimated_max_price: 6000,
+          final_price: 5000,
+          currency: "EGP",
+          status: "customer_approved",
+          approval_type: "final_fixed",
+          created_by: null,
+          updated_by: null,
+          created_at: "2026-01-01T00:00:00.000Z",
+          updated_at: "2026-01-01T00:00:00.000Z",
+          customer_approved_at: "2026-01-01T00:00:00.000Z",
+        },
+        isCustomerView: true,
+      });
+
+      const stage9 = adapted.stages.find((s) => s.key === "09_settlement");
+      const stage10 = adapted.stages.find((s) => s.key === "10_clearance_release");
+      assert.equal(stage9?.isCompleted, false);
+      assert.equal(stage10?.isCompleted, false);
+      assert.equal(adapted.primaryCustomerAction?.actionType, "settle_duties");
     });
   });
 });

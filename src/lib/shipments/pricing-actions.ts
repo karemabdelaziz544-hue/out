@@ -44,7 +44,7 @@ export async function submitPriceEstimateAction(
   formData: FormData,
 ): Promise<PricingActionResult> {
   try {
-    const adminUser = await requireRole(["admin", "manager"]);
+    const adminUser = await requireRole(["admin"]);
     const shipmentId = formData.get("shipment_id") as string;
     const minPriceRaw = formData.get("estimated_min_price") as string;
     const maxPriceRaw = formData.get("estimated_max_price") as string;
@@ -218,7 +218,7 @@ export async function customerApproveEstimateAction(
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: shipment, error: shipErr } = await (supabase.from("shipments") as any)
-      .select("id, company_id, status")
+      .select("id, company_id, customer_id, status")
       .eq("id", shipmentId)
       .maybeSingle();
 
@@ -226,7 +226,10 @@ export async function customerApproveEstimateAction(
       return { success: false, error: "الشحنة غير موجودة." };
     }
 
-    if (shipment.company_id !== customerCompany.id) {
+    if (
+      shipment.company_id !== customerCompany.id ||
+      (shipment.customer_id && shipment.customer_id !== currentUser.id)
+    ) {
       return { success: false, error: "غير مصرح لك باعتماد سعر هذه الشحنة." };
     }
 
@@ -377,7 +380,7 @@ export async function customerRequestNegotiationAction(
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: shipment, error: shipErr } = await (supabase.from("shipments") as any)
-      .select("id, company_id, status, reference_number")
+      .select("id, company_id, customer_id, status, reference_number")
       .eq("id", shipmentId)
       .maybeSingle();
 
@@ -385,7 +388,10 @@ export async function customerRequestNegotiationAction(
       return { success: false, error: "الشحنة غير موجودة." };
     }
 
-    if (shipment.company_id !== customerCompany.id) {
+    if (
+      shipment.company_id !== customerCompany.id ||
+      (shipment.customer_id && shipment.customer_id !== currentUser.id)
+    ) {
       return { success: false, error: "غير مصرح لك بالتفاوض على هذه الشحنة." };
     }
 
@@ -492,7 +498,7 @@ export async function adminSetFinalPriceAction(
   formData: FormData,
 ): Promise<PricingActionResult> {
   try {
-    const adminUser = await requireRole(["admin", "manager"]);
+    const adminUser = await requireRole(["admin"]);
     const shipmentId = formData.get("shipment_id") as string;
     const finalPriceRaw = formData.get("final_price") as string;
 
@@ -517,6 +523,28 @@ export async function adminSetFinalPriceAction(
       return { success: false, error: "الشحنة غير موجودة." };
     }
 
+    if (["customs_cleared", "delivered"].includes(shipment.status)) {
+      return {
+        success: false,
+        error: "لا يمكن تعديل السعر النهائي بعد إتمام التخليص الجمركي أو تسليم الشحنة.",
+      };
+    }
+
+    // Check Stage 9 status: block price changes after financial settlement is completed
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: stage9Row } = await (supabase.from("shipment_customs_stages") as any)
+      .select("status")
+      .eq("shipment_id", shipmentId)
+      .eq("stage_key", "stage_9_fees_payments")
+      .maybeSingle();
+
+    if (stage9Row?.status === "completed") {
+      return {
+        success: false,
+        error: "لا يمكن تعديل السعر النهائي بعد إغلاق مرحلة التسوية المالية (المرحلة التاسعة).",
+      };
+    }
+
     // Fetch existing pricing
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: pricing, error: pricingErr } = await (supabase.from("shipment_pricing") as any)
@@ -528,51 +556,58 @@ export async function adminSetFinalPriceAction(
       return { success: false, error: "سجل التسعير غير متوفر." };
     }
 
-    const isEstablishingFinalForApprovedRange =
-      pricing.status === "customer_approved" &&
-      pricing.approval_type === "estimated_range" &&
-      !["negotiation", "price_agreed"].includes(shipment.status);
+    const canSetOrUpdateFinalPrice =
+      ["negotiation", "price_agreed"].includes(shipment.status) ||
+      ["customer_approved", "final_proposed"].includes(pricing.status);
 
-    if (
-      shipment.status !== "negotiation" &&
-      shipment.status !== "price_agreed" &&
-      !isEstablishingFinalForApprovedRange
-    ) {
+    if (!canSetOrUpdateFinalPrice) {
       return {
         success: false,
-        error: "لا يمكن تحديد السعر النهائي إلا لشحنة في مرحلة التفاوض أو لتثبيت السعر النهائي لنطاق تقديري معتمد.",
+        error: "لا يمكن تحديد السعر النهائي إلا لشحنة في مرحلة التفاوض أو بعد اعتماد العرض المبدئي وقبل التسوية النهائية.",
       };
     }
 
-    if (isEstablishingFinalForApprovedRange) {
-      // Shipment already advanced past Phase 1 on an estimated range; lock in the final fixed price
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const { error: updatePricingErr } = await (supabase.from("shipment_pricing") as any)
-        .update({
-          final_price: finalPrice,
-          approval_type: "final_fixed",
-          updated_by: adminUser.id,
-        })
-        .eq("id", pricing.id);
+    const isUnchangedApprovedFixed =
+      pricing.status === "customer_approved" &&
+      pricing.approval_type === "final_fixed" &&
+      pricing.final_price !== null &&
+      Number(pricing.final_price) === finalPrice;
 
-      if (updatePricingErr) {
-        return { success: false, error: "تعذر تثبيت السعر النهائي." };
-      }
-    } else {
-      // Standard negotiation flow -> requires customer approval
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const { error: updatePricingErr } = await (supabase.from("shipment_pricing") as any)
-        .update({
-          final_price: finalPrice,
-          status: "final_proposed",
-          updated_by: adminUser.id,
-        })
-        .eq("id", pricing.id);
+    if (isUnchangedApprovedFixed) {
+      return {
+        success: true,
+        message: "السعر النهائي مسجل ومعتمد من العميل بنفس القيمة مسبقاً.",
+      };
+    }
 
-      if (updatePricingErr) {
-        return { success: false, error: "تعذر تسجيل السعر النهائي." };
-      }
+    const wasPreviouslyApproved = pricing.status === "customer_approved";
+    const wasRangeApproval = pricing.approval_type === "estimated_range";
 
+    // Any new or updated final_price requires explicit customer confirmation (`final_proposed`)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { error: updatePricingErr } = await (supabase.from("shipment_pricing") as any)
+      .update({
+        final_price: finalPrice,
+        status: "final_proposed",
+        customer_approved_at: null,
+        customer_approved_by: null,
+        approval_type: null,
+        approval_source: null,
+        approval_recorded_by: null,
+        approval_channel: null,
+        confirmed_by_name: null,
+        confirmation_reference: null,
+        updated_by: adminUser.id,
+      })
+      .eq("id", pricing.id);
+
+    if (updatePricingErr) {
+      return { success: false, error: "تعذر تسجيل السعر النهائي." };
+    }
+
+    // Only transition shipments.status to 'price_agreed' during negotiation/price_agreed;
+    // preserve later operational statuses (awaiting_invoice_review, acid_issued, customs_in_progress, etc.)
+    if (["negotiation", "price_agreed"].includes(shipment.status)) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await (supabase.from("shipments") as any)
         .update({ status: "price_agreed", updated_by: adminUser.id })
@@ -590,8 +625,10 @@ export async function adminSetFinalPriceAction(
       final_price: finalPrice,
       currency: pricing.currency,
       performed_by: adminUser.id,
-      notes: isEstablishingFinalForApprovedRange
-        ? `تم تثبيت السعر النهائي لأتعاب التخليص ضمن النطاق المعتمد: ${finalPrice} ${pricing.currency}`
+      notes: wasPreviouslyApproved
+        ? wasRangeApproval
+          ? `تم تحديد السعر النهائي المقترح (${finalPrice} ${pricing.currency}) بدلاً من النطاق التقديري المعتمد — بانتظار موافقة العميل`
+          : `تم تعديل السعر النهائي إلى (${finalPrice} ${pricing.currency}) وإلغاء الاعتماد السابق — بانتظار موافقة العميل الجديدة`
         : `تم تحديد السعر النهائي بعد التفاوض: ${finalPrice} ${pricing.currency}`,
     });
 
@@ -599,9 +636,9 @@ export async function adminSetFinalPriceAction(
       await createNotification({
         userId: shipment.customer_id,
         shipmentId,
-        title: "تحديد السعر النهائي",
-        message: isEstablishingFinalForApprovedRange
-          ? `تم تثبيت السعر النهائي لأتعاب التخليص للشحنة ${shipment.reference_number || ""} بقيمة ${finalPrice} ${pricing.currency}.`
+        title: wasPreviouslyApproved ? "تحديث السعر النهائي — مطلوب اعتمادك" : "تحديد السعر النهائي",
+        message: wasPreviouslyApproved
+          ? `تم ${wasRangeApproval ? "تحديد" : "تعديل"} السعر النهائي لأتعاب التخليص للشحنة ${shipment.reference_number || ""} إلى ${finalPrice} ${pricing.currency}. يرجى المراجعة والاعتماد.`
           : `تم تحديد السعر النهائي للشحنة ${shipment.reference_number || ""}: ${finalPrice} ${pricing.currency}. بانتظار موافقتك.`,
         type: "pricing",
         link: `/my-shipments/${shipmentId}`,
@@ -615,8 +652,8 @@ export async function adminSetFinalPriceAction(
 
     return {
       success: true,
-      message: isEstablishingFinalForApprovedRange
-        ? "تم تثبيت السعر النهائي لأتعاب التخليص بنجاح وإشعار العميل."
+      message: wasPreviouslyApproved
+        ? "تم تحديث السعر النهائي وإعادة فتحه بانتظار موافقة العميل."
         : "تم حفظ السعر النهائي المتفق عليه، وأصبح جاهزاً لموافقة العميل.",
     };
   } catch (err) {
@@ -652,7 +689,7 @@ export async function customerApproveFinalPriceAction(
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: shipment, error: shipErr } = await (supabase.from("shipments") as any)
-      .select("id, company_id, status, reference_number")
+      .select("id, company_id, customer_id, status, reference_number")
       .eq("id", shipmentId)
       .maybeSingle();
 
@@ -660,18 +697,24 @@ export async function customerApproveFinalPriceAction(
       return { success: false, error: "الشحنة غير موجودة." };
     }
 
-    if (shipment.company_id !== customerCompany.id) {
+    if (
+      shipment.company_id !== customerCompany.id ||
+      (shipment.customer_id && shipment.customer_id !== currentUser.id)
+    ) {
       return { success: false, error: "غير مصرح لك باعتماد هذا السعر." };
     }
 
-    if (shipment.status === "awaiting_invoice_review") {
-      return {
-        success: true,
-        message: "تم اعتماد السعر النهائي مسبقاً، والطلب الآن بانتظار مراجعة الفاتورة.",
-      };
-    }
+    const allowedFinalApprovalStatuses = [
+      "price_agreed",
+      "awaiting_invoice_review",
+      "invoice_revision_required",
+      "acid_issued",
+      "documents_completed",
+      "ready_for_external_stage",
+      "customs_in_progress",
+    ];
 
-    if (shipment.status !== "price_agreed") {
+    if (!allowedFinalApprovalStatuses.includes(shipment.status)) {
       return {
         success: false,
         error: "حالة الشحنة الحالية لا تسمح باعتماد السعر النهائي.",
@@ -688,10 +731,10 @@ export async function customerApproveFinalPriceAction(
       return { success: false, error: "السعر النهائي غير متوفر." };
     }
 
-    if (pricing.status === "customer_approved") {
+    if (pricing.status === "customer_approved" && pricing.approval_type === "final_fixed") {
       return {
         success: true,
-        message: "تم اعتماد السعر النهائي مسبقاً، والطلب الآن بانتظار مراجعة الفاتورة.",
+        message: "تم اعتماد السعر النهائي مسبقاً، والطلب قيد المتابعة.",
       };
     }
 
@@ -734,16 +777,34 @@ export async function customerApproveFinalPriceAction(
     }
 
     if (!updatedPricing || updatedPricing.length === 0) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data: racedPricing } = await (supabase.from("shipment_pricing") as any)
+        .select("status, approval_type")
+        .eq("id", pricing.id)
+        .maybeSingle();
+
+      if (
+        racedPricing?.status === "customer_approved" &&
+        racedPricing?.approval_type === "final_fixed"
+      ) {
+        return {
+          success: true,
+          message: "تم اعتماد السعر النهائي مسبقاً.",
+        };
+      }
+
       return {
-        success: true,
-        message: "تم اعتماد السعر النهائي مسبقاً، والطلب الآن بانتظار مراجعة الفاتورة.",
+        success: false,
+        error: "تعذر اعتماد السعر النهائي بسبب تحديث متزامن أو عدم كفاية الصلاحية.",
       };
     }
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await (supabase.from("shipments") as any)
-      .update({ status: "awaiting_invoice_review", updated_by: currentUser.id })
-      .eq("id", shipmentId);
+    if (shipment.status === "price_agreed") {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (supabase.from("shipments") as any)
+        .update({ status: "awaiting_invoice_review", updated_by: currentUser.id })
+        .eq("id", shipmentId);
+    }
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (supabase.from("shipment_pricing_history") as any).insert({
@@ -839,10 +900,21 @@ export async function adminRecordCustomerPriceApprovalAction(
       return { success: false, error: "الشحنة غير موجودة." };
     }
 
-    if (shipment.status !== "price_proposed" && shipment.status !== "price_agreed") {
+    const allowedStatuses = [
+      "price_proposed",
+      "price_agreed",
+      "awaiting_invoice_review",
+      "invoice_revision_required",
+      "acid_issued",
+      "documents_completed",
+      "ready_for_external_stage",
+      "customs_in_progress",
+    ];
+
+    if (!allowedStatuses.includes(shipment.status)) {
       return {
         success: false,
-        error: "لا يمكن توثيق موافقة العميل إلا عندما يكون هناك عرض سعر مقدم أو سعر نهائي محدد.",
+        error: "حالة الشحنة الحالية لا تسمح بتوثيق موافقة على عرض السعر.",
       };
     }
 
@@ -856,7 +928,12 @@ export async function adminRecordCustomerPriceApprovalAction(
       return { success: false, error: "سجل التسعير غير متوفر." };
     }
 
-    if (pricing.status !== "proposed" && pricing.status !== "final_proposed") {
+    const canRecordProposedEstimate =
+      pricing.status === "proposed" && shipment.status === "price_proposed";
+    const canRecordFinalOffer =
+      pricing.status === "final_proposed" && pricing.final_price !== null;
+
+    if (!canRecordProposedEstimate && !canRecordFinalOffer) {
       return {
         success: false,
         error: "عرض السعر الحالي ليس في حالة انتظار موافقة.",
@@ -899,10 +976,12 @@ export async function adminRecordCustomerPriceApprovalAction(
       return { success: false, error: `تعذر تسجيل الموافقة: ${updateErr.message}` };
     }
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await (supabase.from("shipments") as any)
-      .update({ status: "awaiting_invoice_review", updated_by: adminUser.id })
-      .eq("id", shipmentId);
+    if (shipment.status === "price_proposed" || shipment.status === "price_agreed") {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (supabase.from("shipments") as any)
+        .update({ status: "awaiting_invoice_review", updated_by: adminUser.id })
+        .eq("id", shipmentId);
+    }
 
     // Record in history audit trail under the ACTUAL Admin actor (`performed_by: adminUser.id`)
     // eslint-disable-next-line @typescript-eslint/no-explicit-any

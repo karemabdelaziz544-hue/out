@@ -419,8 +419,8 @@ export async function approveDocumentAction(
   documentId: string,
 ): Promise<DocumentActionResult> {
   try {
-    // STRICT ADMIN/MANAGER CHECK
-    const currentAdmin = await requireRole(["admin", "manager"]);
+    // STRICT ADMIN CHECK (Manager is read-only)
+    const currentAdmin = await requireRole(["admin"]);
 
     if (!documentId) {
       return { success: false, error: "معرّف المستند غير صالح." };

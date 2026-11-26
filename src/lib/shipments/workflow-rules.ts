@@ -440,6 +440,8 @@ export interface ValidationContext {
   referenceNumber?: string | null;
   notes?: string | null;
   rejectionOrDelayReason?: string | null;
+  /** When true, Stage 9 completion is backed by the 0019 financial ledger rather than legacy stage_data JSONB. */
+  isFinancialLedgerSettled?: boolean;
 }
 
 export interface ValidationResult {
@@ -594,7 +596,9 @@ export function validateStagePrerequisites(ctx: ValidationContext): ValidationRe
     }
 
     // Stage 9: Customs Duties Settlement
-    if (ctx.stageKey === "stage_9_fees_payments") {
+    // When backed by the Migration 0019 financial ledger (`isFinancialLedgerSettled === true`),
+    // skip deprecated legacy JSONB checks while still enforcing all stage/document prerequisites above.
+    if (ctx.stageKey === "stage_9_fees_payments" && !ctx.isFinancialLedgerSettled) {
       const sData = ctx.stageData as CustomsDutiesSettlementData | undefined;
       if (sData?.settlement_status === "paid_by_out_awaiting_customer") {
         return {

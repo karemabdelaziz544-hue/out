@@ -58,6 +58,18 @@ import {
   toPiastres,
   validateFinancialTransactionInput,
 } from "./financial-calculations";
+import { matchFinalDocumentType } from "../../types/document";
+import {
+  CUSTOMS_STAGE_DEFINITIONS,
+  type CustomsStageStatus,
+  type ShipmentRegulatoryProcedure,
+} from "../../types/journey";
+import {
+  STAGE_WORKFLOW_RULES,
+  resolveNextApplicableStageKey,
+  validateStagePrerequisites,
+  type StageStateSnapshot,
+} from "./workflow-rules";
 import {
   getShipmentCustomsObligationsQuery,
   getShipmentFinancialSummaryQuery,
@@ -737,6 +749,202 @@ export async function getShipmentCustomsObligationsAction(
  * Helper to check idempotency and active reference uniqueness before inserting a transaction,
  * and to verify customs obligation allocation bounds when `customs_obligation_id` is supplied.
  */
+interface ExpectedIdempotentTxPayload {
+  shipmentId: string;
+  direction: 1 | -1;
+  entryCategory: FinancialTransactionCategory;
+  entryType: FinancialTransactionType;
+  customsObligationId: string | null;
+  amount: MonetaryNumericValue;
+  allocatedCustomsAmount: MonetaryNumericValue;
+  isBillableToCustomer: boolean;
+  customerVisible: boolean;
+  paymentMethod: FinancialPaymentMethod | null;
+  referenceNumber: string | null;
+  recipientOrCounterparty?: string | null;
+  attachmentDocumentId?: string | null;
+  description?: string | null;
+  explicitTransactionDate?: string | null;
+  reversalOfTransactionId?: string | null;
+  reversalReason?: string | null;
+}
+
+function normalizeOptionalTrimmed(value: string | null | undefined): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function isMatchingIdempotentTransaction(
+  existing: ShipmentFinancialTransactionRow,
+  expected: ExpectedIdempotentTxPayload,
+): boolean {
+  const existingDirection = existing.direction === -1 ? -1 : 1;
+  if (existing.shipment_id !== expected.shipmentId) return false;
+  if (existingDirection !== expected.direction) return false;
+  if (existing.entry_category !== expected.entryCategory) return false;
+  if (existing.entry_type !== expected.entryType) return false;
+
+  if (
+    normalizeOptionalTrimmed(existing.customs_obligation_id) !==
+    normalizeOptionalTrimmed(expected.customsObligationId)
+  ) {
+    return false;
+  }
+
+  if (toPiastres(existing.amount) !== toPiastres(expected.amount)) return false;
+  if (
+    toPiastres(existing.allocated_customs_amount) !==
+    toPiastres(expected.allocatedCustomsAmount)
+  ) {
+    return false;
+  }
+
+  if (
+    Boolean(existing.is_billable_to_customer) !== Boolean(expected.isBillableToCustomer)
+  ) {
+    return false;
+  }
+
+  // `customer_direct_customs_payment` starts with customer_visible=false until verified;
+  // allow idempotent retry even after an admin verified it.
+  if (
+    expected.entryCategory !== "customer_direct_customs_payment" ||
+    existing.entry_status === "pending_verification"
+  ) {
+    if (Boolean(existing.customer_visible) !== Boolean(expected.customerVisible)) {
+      return false;
+    }
+  }
+
+  if (
+    normalizeOptionalTrimmed(existing.payment_method) !==
+    normalizeOptionalTrimmed(expected.paymentMethod)
+  ) {
+    return false;
+  }
+
+  if (
+    normalizeOptionalTrimmed(existing.reference_number) !==
+    normalizeOptionalTrimmed(expected.referenceNumber)
+  ) {
+    return false;
+  }
+
+  if (
+    normalizeOptionalTrimmed(existing.recipient_or_counterparty) !==
+    normalizeOptionalTrimmed(expected.recipientOrCounterparty)
+  ) {
+    return false;
+  }
+
+  const existingAttachment = normalizeOptionalTrimmed(existing.attachment_document_id);
+  const expectedAttachment = normalizeOptionalTrimmed(expected.attachmentDocumentId);
+  if (
+    expected.entryCategory === "customer_direct_customs_payment" &&
+    existing.entry_status === "posted"
+  ) {
+    // Verification attaches or confirms receipt document (`attachment_document_id`);
+    // allow retries with omitted attachment, while rejecting explicitly different document IDs.
+    if (expectedAttachment !== null && existingAttachment !== expectedAttachment) {
+      return false;
+    }
+  } else if (existingAttachment !== expectedAttachment) {
+    return false;
+  }
+
+  const expectedDate = normalizeOptionalTrimmed(expected.explicitTransactionDate);
+  if (expectedDate !== null) {
+    const existingMs = Date.parse(existing.transaction_date);
+    const expectedMs = Date.parse(expectedDate);
+    if (!Number.isNaN(expectedMs) && !Number.isNaN(existingMs)) {
+      if (existingMs !== expectedMs) return false;
+    } else if (normalizeOptionalTrimmed(existing.transaction_date) !== expectedDate) {
+      return false;
+    }
+  }
+
+  if (expected.direction === -1) {
+    if (
+      normalizeOptionalTrimmed(existing.reversal_of_transaction_id) !==
+      normalizeOptionalTrimmed(expected.reversalOfTransactionId)
+    ) {
+      return false;
+    }
+    if (
+      normalizeOptionalTrimmed(existing.reversal_reason) !==
+      normalizeOptionalTrimmed(expected.reversalReason)
+    ) {
+      return false;
+    }
+    return true;
+  }
+
+  const expectedDesc = normalizeOptionalTrimmed(expected.description);
+  const existingDesc = normalizeOptionalTrimmed(existing.description);
+  if (
+    expected.entryCategory === "customer_direct_customs_payment" &&
+    existing.entry_status === "posted"
+  ) {
+    const matchesDirectVerificationNote =
+      existingDesc === expectedDesc ||
+      (expectedDesc !== null
+        ? Boolean(existingDesc?.startsWith(`${expectedDesc} | [توثيق الاعتماد]:`))
+        : Boolean(existingDesc?.startsWith("[توثيق الاعتماد]:")));
+    if (!matchesDirectVerificationNote) return false;
+  } else if (existingDesc !== expectedDesc) {
+    return false;
+  }
+
+  return true;
+}
+
+async function resolveIdempotentInsertConflict(params: {
+  supabase: SupabaseServerClientLike;
+  shipmentId: string;
+  idempotencyKey: string;
+  expected: ExpectedIdempotentTxPayload;
+  insertError: { code?: string; message?: string; details?: string } | null | undefined;
+  fallbackMessage: string;
+}): Promise<FinancialResult<ShipmentFinancialTransaction>> {
+  const errCode = String(params.insertError?.code || "");
+  const errMsg = String(params.insertError?.message || "");
+  const isIdempotencyCollision =
+    errCode === "23505" || errMsg.includes("idx_uq_financial_tx_idempotency");
+
+  if (isIdempotencyCollision) {
+    const { data: racedTx } = await params.supabase
+      .from("shipment_financial_transactions")
+      .select("*")
+      .eq("shipment_id", params.shipmentId)
+      .eq("idempotency_key", params.idempotencyKey)
+      .maybeSingle();
+
+    if (racedTx) {
+      const racedRow = racedTx as ShipmentFinancialTransactionRow;
+      if (isMatchingIdempotentTransaction(racedRow, params.expected)) {
+        return {
+          success: true,
+          message:
+            params.expected.direction === -1
+              ? "تم تنفيذ القيد العكسي مسبقاً بنفس البيانات."
+              : "تم تنفيذ هذه الحركة المالية مسبقاً بنفس البيانات (استجابة متكافئة عبر idempotency_key).",
+          data: normalizeFinancialTransactionRow(racedRow),
+        };
+      }
+
+      return {
+        success: false,
+        code: "DUPLICATE_TRANSACTION",
+        error:
+          "تم استخدام مفتاح عدم التكرار (idempotency_key) مسبقاً مع بيانات مالية مختلفة.",
+      };
+    }
+  }
+
+  return mapDatabaseFinancialError(params.insertError, params.fallbackMessage);
+}
+
 async function prevalidateTransactionInsertion(params: {
   supabase: SupabaseServerClientLike;
   shipmentId: string;
@@ -750,6 +958,10 @@ async function prevalidateTransactionInsertion(params: {
   customerVisible: boolean;
   paymentMethod: FinancialPaymentMethod | null;
   referenceNumber: string | null;
+  recipientOrCounterparty?: string | null;
+  attachmentDocumentId?: string | null;
+  description?: string | null;
+  explicitTransactionDate?: string | null;
   idempotencyKey: string;
   verifiedBy: string | null;
   verifiedAt: string | null;
@@ -767,14 +979,73 @@ async function prevalidateTransactionInsertion(params: {
     .maybeSingle();
 
   if (existingIdem) {
+    const existingRow = existingIdem as ShipmentFinancialTransactionRow;
+    const isMatch = isMatchingIdempotentTransaction(existingRow, {
+      shipmentId: params.shipmentId,
+      direction: 1,
+      entryCategory: params.entryCategory,
+      entryType: params.entryType,
+      customsObligationId: params.customsObligationId,
+      amount: params.amount,
+      allocatedCustomsAmount: params.allocatedCustomsAmount,
+      isBillableToCustomer: params.isBillableToCustomer,
+      customerVisible: params.customerVisible,
+      paymentMethod: params.paymentMethod,
+      referenceNumber: params.referenceNumber,
+      recipientOrCounterparty: params.recipientOrCounterparty,
+      attachmentDocumentId: params.attachmentDocumentId,
+      description: params.description,
+      explicitTransactionDate: params.explicitTransactionDate,
+    });
+
+    if (isMatch) {
+      return {
+        valid: true,
+        existingIdempotentTx: normalizeFinancialTransactionRow(existingRow),
+      };
+    }
+
     return {
       valid: false,
       errorResult: {
         success: false,
         code: "DUPLICATE_TRANSACTION",
-        error: "تم تنفيذ هذه الحركة المالية مسبقاً (تم منع التكرار عبر مفتاح عدم التكرار idempotency_key).",
+        error:
+          "تم استخدام مفتاح عدم التكرار (idempotency_key) مسبقاً مع بيانات مالية مختلفة.",
       },
     };
+  }
+
+  // 1b. Verify optional attachment_document_id exists and belongs to the same shipment
+  const cleanAttachmentId = normalizeOptionalTrimmed(params.attachmentDocumentId);
+  if (cleanAttachmentId) {
+    if (!isValidUuid(cleanAttachmentId)) {
+      return {
+        valid: false,
+        errorResult: {
+          success: false,
+          code: "VALIDATION_ERROR",
+          error: "معرف المستند المرفق بالحركة المالية غير صالح.",
+        },
+      };
+    }
+
+    const { data: docRow, error: docErr } = await params.supabase
+      .from("documents")
+      .select("id, shipment_id")
+      .eq("id", cleanAttachmentId)
+      .maybeSingle();
+
+    if (docErr || !docRow || docRow.shipment_id !== params.shipmentId) {
+      return {
+        valid: false,
+        errorResult: {
+          success: false,
+          code: "VALIDATION_ERROR",
+          error: "المستند المرفق بالحركة المالية غير موجود أو لا ينتمي لهذه الشحنة.",
+        },
+      };
+    }
   }
 
   // 2. Check active reference_number uniqueness per (shipment_id, entry_category)
@@ -1041,6 +1312,10 @@ export async function recordOutDisbursementAction(
   }
 
   const nowIso = new Date().toISOString();
+  const recipientOrCounterparty = input.recipient_or_counterparty?.trim() || null;
+  const attachmentDocumentId = input.attachment_document_id?.trim() || null;
+  const description = input.description?.trim() || null;
+  const explicitTransactionDate = input.transaction_date?.trim() || null;
 
   const precheck = await prevalidateTransactionInsertion({
     supabase: access.supabase,
@@ -1055,6 +1330,10 @@ export async function recordOutDisbursementAction(
     customerVisible,
     paymentMethod: input.payment_method as FinancialPaymentMethod,
     referenceNumber: input.reference_number.trim(),
+    recipientOrCounterparty,
+    attachmentDocumentId,
+    description,
+    explicitTransactionDate,
     idempotencyKey: input.idempotency_key.trim(),
     verifiedBy: access.actor.id,
     verifiedAt: nowIso,
@@ -1062,6 +1341,14 @@ export async function recordOutDisbursementAction(
 
   if (!precheck.valid) {
     return precheck.errorResult!;
+  }
+
+  if (precheck.existingIdempotentTx) {
+    return {
+      success: true,
+      message: "تم تسجيل المصروف مسبقاً بنفس البيانات (استجابة متكافئة عبر idempotency_key).",
+      data: precheck.existingIdempotentTx,
+    };
   }
 
   const { data: inserted, error: insertErr } = await access.supabase
@@ -1080,10 +1367,10 @@ export async function recordOutDisbursementAction(
       customer_visible: customerVisible,
       payment_method: input.payment_method,
       reference_number: input.reference_number.trim(),
-      recipient_or_counterparty: input.recipient_or_counterparty?.trim() || null,
-      transaction_date: input.transaction_date || nowIso,
-      attachment_document_id: input.attachment_document_id?.trim() || null,
-      description: input.description?.trim() || null,
+      recipient_or_counterparty: recipientOrCounterparty,
+      transaction_date: explicitTransactionDate || nowIso,
+      attachment_document_id: attachmentDocumentId,
+      description,
       idempotency_key: input.idempotency_key.trim(),
       created_by: access.actor.id,
       verified_by: access.actor.id,
@@ -1093,10 +1380,30 @@ export async function recordOutDisbursementAction(
     .single();
 
   if (insertErr || !inserted) {
-    return mapDatabaseFinancialError(
-      insertErr,
-      "تعذر تسجيل المصروف في دفتر الأستاذ المالي.",
-    );
+    return resolveIdempotentInsertConflict({
+      supabase: access.supabase,
+      shipmentId: input.shipment_id.trim(),
+      idempotencyKey: input.idempotency_key.trim(),
+      expected: {
+        shipmentId: input.shipment_id.trim(),
+        direction: 1,
+        entryCategory: "out_disbursement",
+        entryType: input.entry_type,
+        customsObligationId,
+        amount: amountFormatted,
+        allocatedCustomsAmount,
+        isBillableToCustomer: isBillable,
+        customerVisible,
+        paymentMethod: input.payment_method as FinancialPaymentMethod,
+        referenceNumber: input.reference_number.trim(),
+        recipientOrCounterparty,
+        attachmentDocumentId,
+        description,
+        explicitTransactionDate,
+      },
+      insertError: insertErr,
+      fallbackMessage: "تعذر تسجيل المصروف في دفتر الأستاذ المالي.",
+    });
   }
 
   await safeRevalidateShipmentPaths(input.shipment_id);
@@ -1162,6 +1469,11 @@ export async function recordCustomerPaymentToOutAction(
 
   const amountFormatted = fromPiastres(amountPiastres);
   const nowIso = new Date().toISOString();
+  const recipientOrCounterparty =
+    input.recipient_or_counterparty?.trim() || "خزينة / حسابات شركة OUT";
+  const attachmentDocumentId = input.attachment_document_id?.trim() || null;
+  const description = input.description?.trim() || null;
+  const explicitTransactionDate = input.transaction_date?.trim() || null;
 
   const precheck = await prevalidateTransactionInsertion({
     supabase: access.supabase,
@@ -1176,6 +1488,10 @@ export async function recordCustomerPaymentToOutAction(
     customerVisible: true,
     paymentMethod: input.payment_method as FinancialPaymentMethod,
     referenceNumber: input.reference_number.trim(),
+    recipientOrCounterparty,
+    attachmentDocumentId,
+    description,
+    explicitTransactionDate,
     idempotencyKey: input.idempotency_key.trim(),
     verifiedBy: access.actor.id,
     verifiedAt: nowIso,
@@ -1183,6 +1499,14 @@ export async function recordCustomerPaymentToOutAction(
 
   if (!precheck.valid) {
     return precheck.errorResult!;
+  }
+
+  if (precheck.existingIdempotentTx) {
+    return {
+      success: true,
+      message: "تم تسجيل دفعة التحصيل مسبقاً بنفس البيانات (استجابة متكافئة عبر idempotency_key).",
+      data: precheck.existingIdempotentTx,
+    };
   }
 
   const { data: inserted, error: insertErr } = await access.supabase
@@ -1201,11 +1525,10 @@ export async function recordCustomerPaymentToOutAction(
       customer_visible: true,
       payment_method: input.payment_method,
       reference_number: input.reference_number.trim(),
-      recipient_or_counterparty:
-        input.recipient_or_counterparty?.trim() || "خزينة / حسابات شركة OUT",
-      transaction_date: input.transaction_date || nowIso,
-      attachment_document_id: input.attachment_document_id?.trim() || null,
-      description: input.description?.trim() || null,
+      recipient_or_counterparty: recipientOrCounterparty,
+      transaction_date: explicitTransactionDate || nowIso,
+      attachment_document_id: attachmentDocumentId,
+      description,
       idempotency_key: input.idempotency_key.trim(),
       created_by: access.actor.id,
       verified_by: access.actor.id,
@@ -1215,10 +1538,30 @@ export async function recordCustomerPaymentToOutAction(
     .single();
 
   if (insertErr || !inserted) {
-    return mapDatabaseFinancialError(
-      insertErr,
-      "تعذر تسجيل دفعة العميل في دفتر الأستاذ المالي.",
-    );
+    return resolveIdempotentInsertConflict({
+      supabase: access.supabase,
+      shipmentId: input.shipment_id.trim(),
+      idempotencyKey: input.idempotency_key.trim(),
+      expected: {
+        shipmentId: input.shipment_id.trim(),
+        direction: 1,
+        entryCategory: "customer_payment_to_out",
+        entryType: input.entry_type,
+        customsObligationId: null,
+        amount: amountFormatted,
+        allocatedCustomsAmount: 0,
+        isBillableToCustomer: true,
+        customerVisible: true,
+        paymentMethod: input.payment_method as FinancialPaymentMethod,
+        referenceNumber: input.reference_number.trim(),
+        recipientOrCounterparty,
+        attachmentDocumentId,
+        description,
+        explicitTransactionDate,
+      },
+      insertError: insertErr,
+      fallbackMessage: "تعذر تسجيل دفعة العميل في دفتر الأستاذ المالي.",
+    });
   }
 
   await safeRevalidateShipmentPaths(input.shipment_id);
@@ -1293,6 +1636,11 @@ export async function recordCustomerDirectCustomsPaymentAction(
 
   const amountFormatted = fromPiastres(amountPiastres);
   const nowIso = new Date().toISOString();
+  const recipientOrCounterparty =
+    input.recipient_or_counterparty?.trim() || "مصلحة الجمارك المصرية";
+  const attachmentDocumentId = input.attachment_document_id?.trim() || null;
+  const description = input.description?.trim() || null;
+  const explicitTransactionDate = input.transaction_date?.trim() || null;
 
   const precheck = await prevalidateTransactionInsertion({
     supabase: access.supabase,
@@ -1307,6 +1655,10 @@ export async function recordCustomerDirectCustomsPaymentAction(
     customerVisible: false, // Required by Migration 0019 while entry_status = 'pending_verification'
     paymentMethod: input.payment_method as FinancialPaymentMethod,
     referenceNumber: input.reference_number.trim(),
+    recipientOrCounterparty,
+    attachmentDocumentId,
+    description,
+    explicitTransactionDate,
     idempotencyKey: input.idempotency_key.trim(),
     verifiedBy: null,
     verifiedAt: null,
@@ -1314,6 +1666,14 @@ export async function recordCustomerDirectCustomsPaymentAction(
 
   if (!precheck.valid) {
     return precheck.errorResult!;
+  }
+
+  if (precheck.existingIdempotentTx) {
+    return {
+      success: true,
+      message: "تم تسجيل إشعار السداد الجمركي المباشر مسبقاً بنفس البيانات.",
+      data: precheck.existingIdempotentTx,
+    };
   }
 
   const { data: inserted, error: insertErr } = await access.supabase
@@ -1332,11 +1692,10 @@ export async function recordCustomerDirectCustomsPaymentAction(
       customer_visible: false,
       payment_method: input.payment_method,
       reference_number: input.reference_number.trim(),
-      recipient_or_counterparty:
-        input.recipient_or_counterparty?.trim() || "مصلحة الجمارك المصرية",
-      transaction_date: input.transaction_date || nowIso,
-      attachment_document_id: input.attachment_document_id?.trim() || null,
-      description: input.description?.trim() || null,
+      recipient_or_counterparty: recipientOrCounterparty,
+      transaction_date: explicitTransactionDate || nowIso,
+      attachment_document_id: attachmentDocumentId,
+      description,
       idempotency_key: input.idempotency_key.trim(),
       created_by: access.actor.id,
       verified_by: null,
@@ -1346,10 +1705,30 @@ export async function recordCustomerDirectCustomsPaymentAction(
     .single();
 
   if (insertErr || !inserted) {
-    return mapDatabaseFinancialError(
-      insertErr,
-      "تعذر تسجيل إشعار السداد الجمركي المباشر.",
-    );
+    return resolveIdempotentInsertConflict({
+      supabase: access.supabase,
+      shipmentId: input.shipment_id.trim(),
+      idempotencyKey: input.idempotency_key.trim(),
+      expected: {
+        shipmentId: input.shipment_id.trim(),
+        direction: 1,
+        entryCategory: "customer_direct_customs_payment",
+        entryType: "customs_duties",
+        customsObligationId: input.customs_obligation_id.trim(),
+        amount: amountFormatted,
+        allocatedCustomsAmount: amountFormatted,
+        isBillableToCustomer: false,
+        customerVisible: false,
+        paymentMethod: input.payment_method as FinancialPaymentMethod,
+        referenceNumber: input.reference_number.trim(),
+        recipientOrCounterparty,
+        attachmentDocumentId,
+        description,
+        explicitTransactionDate,
+      },
+      insertError: insertErr,
+      fallbackMessage: "تعذر تسجيل إشعار السداد الجمركي المباشر.",
+    });
   }
 
   await safeRevalidateShipmentPaths(input.shipment_id);
@@ -1548,13 +1927,37 @@ export async function verifyCustomerDirectCustomsPaymentAction(
     .eq("id", txRow.id)
     .eq("entry_status", "pending_verification")
     .select("*")
-    .single();
+    .maybeSingle();
 
-  if (updateErr || !updated) {
+  if (updateErr) {
     return mapDatabaseFinancialError(
       updateErr,
       "تعذر اعتماد الدفعة الجمركية المباشرة.",
     );
+  }
+
+  if (!updated) {
+    const { data: latestTx } = await access.supabase
+      .from("shipment_financial_transactions")
+      .select("*")
+      .eq("id", txRow.id)
+      .eq("shipment_id", input.shipment_id.trim())
+      .maybeSingle();
+
+    const latestRow = latestTx as ShipmentFinancialTransactionRow | null;
+    if (latestRow?.entry_status === "posted") {
+      return {
+        success: true,
+        message: "تم التحقق من هذه الدفعة واعتمادها مسبقاً.",
+        data: normalizeFinancialTransactionRow(latestRow),
+      };
+    }
+
+    return {
+      success: false,
+      code: "VERIFICATION_FAILED",
+      error: "تغيرت حالة الدفعة الجمركية المباشرة أثناء المعالجة ولا يمكن اعتمادها الآن.",
+    };
   }
 
   await safeRevalidateShipmentPaths(input.shipment_id);
@@ -1644,10 +2047,42 @@ export async function rejectFinancialTransactionAction(
     .eq("id", txRow.id)
     .eq("entry_status", "pending_verification")
     .select("*")
-    .single();
+    .maybeSingle();
 
-  if (updateErr || !updated) {
+  if (updateErr) {
     return mapDatabaseFinancialError(updateErr, "تعذر تسجيل رفض القيد المالي.");
+  }
+
+  if (!updated) {
+    const { data: latestTx } = await access.supabase
+      .from("shipment_financial_transactions")
+      .select("*")
+      .eq("id", txRow.id)
+      .eq("shipment_id", input.shipment_id.trim())
+      .maybeSingle();
+
+    const latestRow = latestTx as ShipmentFinancialTransactionRow | null;
+    if (latestRow?.entry_status === "rejected") {
+      return {
+        success: true,
+        message: "تم رفض هذا القيد المالي مسبقاً.",
+        data: normalizeFinancialTransactionRow(latestRow),
+      };
+    }
+
+    if (latestRow?.entry_status === "posted") {
+      return {
+        success: false,
+        code: "VALIDATION_ERROR",
+        error: "تم اعتماد وترحيل هذا القيد بشكل متزامن؛ استخدم قيد العكس (Reversal) لإلغاء أثره.",
+      };
+    }
+
+    return {
+      success: false,
+      code: "VALIDATION_ERROR",
+      error: "تغيرت حالة القيد المالي أثناء المعالجة وتعذر رفضه.",
+    };
   }
 
   await safeRevalidateShipmentPaths(input.shipment_id);
@@ -1749,6 +2184,10 @@ export async function recordCustomerChargeOrCreditAction(
 
   const amountFormatted = fromPiastres(amountPiastres);
   const nowIso = new Date().toISOString();
+  const referenceNumber = input.reference_number?.trim() || null;
+  const attachmentDocumentId = input.attachment_document_id?.trim() || null;
+  const description = input.description.trim();
+  const explicitTransactionDate = input.transaction_date?.trim() || null;
 
   const precheck = await prevalidateTransactionInsertion({
     supabase: access.supabase,
@@ -1762,7 +2201,11 @@ export async function recordCustomerChargeOrCreditAction(
     isBillableToCustomer: true,
     customerVisible: true,
     paymentMethod: null,
-    referenceNumber: input.reference_number?.trim() || null,
+    referenceNumber,
+    recipientOrCounterparty: null,
+    attachmentDocumentId,
+    description,
+    explicitTransactionDate,
     idempotencyKey: input.idempotency_key.trim(),
     verifiedBy: access.actor.id,
     verifiedAt: nowIso,
@@ -1770,6 +2213,14 @@ export async function recordCustomerChargeOrCreditAction(
 
   if (!precheck.valid) {
     return precheck.errorResult!;
+  }
+
+  if (precheck.existingIdempotentTx) {
+    return {
+      success: true,
+      message: "تم تسجيل القيد المالي مسبقاً بنفس البيانات (استجابة متكافئة عبر idempotency_key).",
+      data: precheck.existingIdempotentTx,
+    };
   }
 
   const { data: inserted, error: insertErr } = await access.supabase
@@ -1787,11 +2238,11 @@ export async function recordCustomerChargeOrCreditAction(
       is_billable_to_customer: true,
       customer_visible: true,
       payment_method: null,
-      reference_number: input.reference_number?.trim() || null,
+      reference_number: referenceNumber,
       recipient_or_counterparty: null,
-      transaction_date: input.transaction_date || nowIso,
-      attachment_document_id: input.attachment_document_id?.trim() || null,
-      description: input.description.trim(),
+      transaction_date: explicitTransactionDate || nowIso,
+      attachment_document_id: attachmentDocumentId,
+      description,
       idempotency_key: input.idempotency_key.trim(),
       created_by: access.actor.id,
       verified_by: access.actor.id,
@@ -1801,10 +2252,30 @@ export async function recordCustomerChargeOrCreditAction(
     .single();
 
   if (insertErr || !inserted) {
-    return mapDatabaseFinancialError(
-      insertErr,
-      "تعذر تسجيل القيد المالي في دفتر الأستاذ.",
-    );
+    return resolveIdempotentInsertConflict({
+      supabase: access.supabase,
+      shipmentId: input.shipment_id.trim(),
+      idempotencyKey: input.idempotency_key.trim(),
+      expected: {
+        shipmentId: input.shipment_id.trim(),
+        direction: 1,
+        entryCategory: input.entry_category,
+        entryType: input.entry_type,
+        customsObligationId: null,
+        amount: amountFormatted,
+        allocatedCustomsAmount: 0,
+        isBillableToCustomer: true,
+        customerVisible: true,
+        paymentMethod: null,
+        referenceNumber,
+        recipientOrCounterparty: null,
+        attachmentDocumentId,
+        description,
+        explicitTransactionDate,
+      },
+      insertError: insertErr,
+      fallbackMessage: "تعذر تسجيل القيد المالي في دفتر الأستاذ.",
+    });
   }
 
   await safeRevalidateShipmentPaths(input.shipment_id);
@@ -1874,10 +2345,27 @@ export async function reverseFinancialTransactionAction(
     .maybeSingle();
 
   if (existingIdem) {
+    const existingRow = existingIdem as ShipmentFinancialTransactionRow;
+    const isMatchingReversal =
+      existingRow.direction === -1 &&
+      normalizeOptionalTrimmed(existingRow.reversal_of_transaction_id) ===
+        input.transaction_id.trim() &&
+      normalizeOptionalTrimmed(existingRow.reversal_reason) ===
+        input.reversal_reason.trim();
+
+    if (isMatchingReversal) {
+      return {
+        success: true,
+        message: "تم تنفيذ القيد العكسي مسبقاً بنفس البيانات.",
+        data: normalizeFinancialTransactionRow(existingRow),
+      };
+    }
+
     return {
       success: false,
       code: "DUPLICATE_TRANSACTION",
-      error: "تم إرسال طلب عكس هذا القيد مسبقاً (تم منع تكرار العملية).",
+      error:
+        "تم استخدام مفتاح عدم التكرار (idempotency_key) مسبقاً لعملية مالية أو عكسية مختلفة.",
     };
   }
 
@@ -2012,10 +2500,30 @@ export async function reverseFinancialTransactionAction(
     .single();
 
   if (insertErr || !insertedReversal) {
-    return mapDatabaseFinancialError(
-      insertErr,
-      "تعذر إنشاء القيد العكسي في دفتر الأستاذ المالي.",
-    );
+    return resolveIdempotentInsertConflict({
+      supabase: access.supabase,
+      shipmentId: orig.shipment_id,
+      idempotencyKey: input.idempotency_key.trim(),
+      expected: {
+        shipmentId: orig.shipment_id,
+        direction: -1,
+        entryCategory: orig.entry_category,
+        entryType: orig.entry_type,
+        customsObligationId: orig.customs_obligation_id,
+        amount: amountFormatted,
+        allocatedCustomsAmount: allocatedFormatted,
+        isBillableToCustomer: orig.is_billable_to_customer,
+        customerVisible: orig.customer_visible,
+        paymentMethod: orig.payment_method,
+        referenceNumber: orig.reference_number,
+        recipientOrCounterparty: orig.recipient_or_counterparty,
+        attachmentDocumentId: orig.attachment_document_id,
+        reversalOfTransactionId: orig.id,
+        reversalReason: input.reversal_reason.trim(),
+      },
+      insertError: insertErr,
+      fallbackMessage: "تعذر إنشاء القيد العكسي في دفتر الأستاذ المالي.",
+    });
   }
 
   await safeRevalidateShipmentPaths(input.shipment_id);
@@ -2063,12 +2571,28 @@ export async function addFinancialInternalNoteAction(
   }
 
   const txId = input.transaction_id?.trim() || null;
-  if (txId && !isValidUuid(txId)) {
-    return {
-      success: false,
-      code: "VALIDATION_ERROR",
-      error: "معرف الحركة المالية المرتبطة بالملاحظة غير صالح.",
-    };
+  if (txId) {
+    if (!isValidUuid(txId)) {
+      return {
+        success: false,
+        code: "VALIDATION_ERROR",
+        error: "معرف الحركة المالية المرتبطة بالملاحظة غير صالح.",
+      };
+    }
+
+    const { data: txCheck, error: txCheckErr } = await access.supabase
+      .from("shipment_financial_transactions")
+      .select("id, shipment_id")
+      .eq("id", txId)
+      .maybeSingle();
+
+    if (txCheckErr || !txCheck || txCheck.shipment_id !== input.shipment_id.trim()) {
+      return {
+        success: false,
+        code: "VALIDATION_ERROR",
+        error: "الحركة المالية المرتبطة بالملاحظة غير موجودة أو لا تنتمي لهذه الشحنة.",
+      };
+    }
   }
 
   const { data: inserted, error: insertErr } = await access.supabase
@@ -2140,12 +2664,14 @@ export async function completeStage9FinancialSettlementAction(
 
   const input = parsed.data;
   const access = await verifyAdminWriteAccessForShipment(input.shipment_id, context);
-  if (!access.authorized || !access.supabase || !access.actor) {
+  if (!access.authorized || !access.supabase || !access.actor || !access.shipment) {
     return access.errorResult!;
   }
 
+  const shipmentId = input.shipment_id.trim();
+
   // Fetch authoritative financial summary from the database RPC
-  const summaryRes = await getShipmentFinancialSummaryQuery(input.shipment_id, {
+  const summaryRes = await getShipmentFinancialSummaryQuery(shipmentId, {
     supabase: access.supabase,
     actor: access.actor,
   });
@@ -2175,25 +2701,106 @@ export async function completeStage9FinancialSettlementAction(
     };
   }
 
-  const nowIso = new Date().toISOString();
+  // Enforce operational stage & document prerequisites for Stage 9 (e.g., Form 46 + Stage 8 Valuation)
+  const [shipDocsRes, allStagesRes, regProcsRes] = await Promise.all([
+    access.supabase
+      .from("documents")
+      .select("document_type, status")
+      .eq("shipment_id", shipmentId),
+    access.supabase
+      .from("shipment_customs_stages")
+      .select(
+        "id, stage_key, stage_order, status, is_applicable, reference_number, stage_data, completed_at, completed_by",
+      )
+      .eq("shipment_id", shipmentId),
+    access.supabase
+      .from("shipment_regulatory_procedures")
+      .select("*")
+      .eq("shipment_id", shipmentId),
+  ]);
 
-  // Fetch existing Stage 9 row to preserve existing non-financial stage_data (e.g. checklist/SLA timestamps)
-  const { data: existingStage } = await access.supabase
-    .from("shipment_customs_stages")
-    .select("id, status, stage_data, reference_number")
-    .eq("shipment_id", input.shipment_id.trim())
-    .eq("stage_key", "stage_9_fees_payments")
-    .maybeSingle();
+  const docStatusMap = new Map<string, string>();
+  for (const d of (shipDocsRes.data || []) as Array<{
+    document_type?: string | null;
+    status?: string | null;
+  }>) {
+    const matched = matchFinalDocumentType(d.document_type);
+    if (matched && d.status) {
+      docStatusMap.set(matched, d.status);
+    }
+  }
 
+  const allStages = (allStagesRes.data || []) as Array<
+    StageStateSnapshot & {
+      id?: string;
+      stage_key: string;
+      stage_order?: number;
+    }
+  >;
+
+  const stagesMap = new Map<string, StageStateSnapshot>(
+    allStages.map((s) => [
+      s.stage_key,
+      {
+        status: s.status,
+        is_applicable: s.is_applicable,
+        reference_number: s.reference_number,
+        stage_data: s.stage_data,
+        completed_at: s.completed_at,
+        completed_by: s.completed_by,
+      },
+    ]),
+  );
+
+  const existingStage = allStages.find(
+    (s) => s.stage_key === "stage_9_fees_payments",
+  );
   const fromStatus = existingStage?.status || "in_progress";
   const resolvedRef =
     input.reference_number?.trim() || existingStage?.reference_number || null;
+
+  const sanitizedStageData: Record<string, unknown> = {
+    ...((existingStage?.stage_data || {}) as Record<string, unknown>),
+  };
+  delete sanitizedStageData.assessed_customs_duties;
+  delete sanitizedStageData.customs_duties_amount;
+  delete sanitizedStageData.amount_paid_by_out;
+  delete sanitizedStageData.duties_paid_by_out;
+  delete sanitizedStageData.amount_collected_from_customer;
+  delete sanitizedStageData.collected_from_customer;
+  delete sanitizedStageData.settlement_status;
+
+  const prerequisiteCheck = validateStagePrerequisites({
+    shipmentStatus: access.shipment.status,
+    stageKey: "stage_9_fees_payments",
+    targetStatus: "completed",
+    currentStatus: (existingStage?.status as CustomsStageStatus) || "pending",
+    stagesMap,
+    documentStatuses: docStatusMap,
+    regulatoryProcedures: (regProcsRes.data || []) as ShipmentRegulatoryProcedure[],
+    stageData: sanitizedStageData,
+    referenceNumber: resolvedRef,
+    notes: input.notes?.trim() || null,
+    isFinancialLedgerSettled: true,
+  });
+
+  if (!prerequisiteCheck.valid) {
+    return {
+      success: false,
+      code: "VALIDATION_ERROR",
+      error:
+        prerequisiteCheck.error ||
+        "لا يمكن إغلاق المرحلة التاسعة قبل استيفاء كافة المراحل والمستندات المسبقة.",
+    };
+  }
+
+  const nowIso = new Date().toISOString();
 
   const { error: stageErr } = await access.supabase
     .from("shipment_customs_stages")
     .upsert(
       {
-        shipment_id: input.shipment_id.trim(),
+        shipment_id: shipmentId,
         stage_key: "stage_9_fees_payments",
         stage_order: 10,
         status: "completed",
@@ -2221,7 +2828,7 @@ export async function completeStage9FinancialSettlementAction(
 
   // Record stage completion in shipment_customs_stage_history
   await access.supabase.from("shipment_customs_stage_history").insert({
-    shipment_id: input.shipment_id.trim(),
+    shipment_id: shipmentId,
     stage_key: "stage_9_fees_payments",
     action: "completed",
     from_status: fromStatus,
@@ -2240,7 +2847,64 @@ export async function completeStage9FinancialSettlementAction(
     performed_by: access.actor.id,
   });
 
-  await safeRevalidateShipmentPaths(input.shipment_id);
+  // Automatically activate Stage 10 if applicable and still pending/absent
+  const updatedAllStages = [
+    ...allStages
+      .filter((s) => s.stage_key !== "stage_9_fees_payments")
+      .map((s) => ({
+        stage_key: s.stage_key,
+        status: s.status,
+        is_applicable: s.is_applicable,
+      })),
+    {
+      stage_key: "stage_9_fees_payments",
+      status: "completed",
+      is_applicable: true,
+    },
+  ];
+  const nextKey = resolveNextApplicableStageKey(
+    "stage_9_fees_payments",
+    updatedAllStages,
+  );
+  if (nextKey === "stage_10_clearance_release") {
+    const nextRule = STAGE_WORKFLOW_RULES[nextKey];
+    const nextDef = CUSTOMS_STAGE_DEFINITIONS[nextKey];
+    const nextExisting = allStages.find((s) => s.stage_key === nextKey);
+
+    if (!nextExisting || nextExisting.status === "pending") {
+      const nextActivatedAt = new Date().toISOString();
+      const targetHours = nextRule.targetDurationHours || 24;
+      const nextTargetCompletion = new Date(
+        Date.now() + targetHours * 3600 * 1000,
+      ).toISOString();
+
+      await access.supabase
+        .from("shipment_customs_stages")
+        .upsert(
+          {
+            shipment_id: shipmentId,
+            stage_key: nextKey,
+            stage_order: nextRule.order,
+            status: nextRule.initialStatus,
+            is_applicable: true,
+            expected_role: nextRule.expectedRole,
+            role_confirmed: nextDef.isRoleConfirmed,
+            stage_data: {
+              ...((nextExisting?.stage_data || {}) as Record<string, unknown>),
+              activated_at: nextActivatedAt,
+              target_completion_at: nextTargetCompletion,
+              target_duration_hours: targetHours,
+              waiting_reason: nextRule.initialWaitingReason,
+            },
+            updated_at: nextActivatedAt,
+            updated_by: access.actor.id,
+          },
+          { onConflict: "shipment_id,stage_key" },
+        );
+    }
+  }
+
+  await safeRevalidateShipmentPaths(shipmentId);
 
   return {
     success: true,

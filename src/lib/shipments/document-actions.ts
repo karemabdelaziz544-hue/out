@@ -350,7 +350,7 @@ export async function adminApproveShipmentDocumentAction(
   formData: FormData,
 ): Promise<ShipmentDocumentActionResult> {
   try {
-    const adminUser = await requireRole(["admin", "manager"]);
+    const adminUser = await requireRole(["admin"]);
 
     const shipmentId = formData.get("shipment_id") as string;
     const documentId = formData.get("document_id") as string;
@@ -469,7 +469,7 @@ export async function adminRequestShipmentDocumentRevisionAction(
   formData: FormData,
 ): Promise<ShipmentDocumentActionResult> {
   try {
-    const adminUser = await requireRole(["admin", "manager"]);
+    const adminUser = await requireRole(["admin"]);
 
     const shipmentId = formData.get("shipment_id") as string;
     const documentId = formData.get("document_id") as string;

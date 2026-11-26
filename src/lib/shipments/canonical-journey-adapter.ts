@@ -46,6 +46,7 @@ import type {
   ShipmentDocumentReviewItem,
   ShipmentStageHistoryItem,
 } from "@/types";
+import type { ShipmentFinancialSummary } from "@/types/financial";
 import { matchFinalDocumentType, FINAL_SHIPMENT_DOCUMENT_TYPES } from "@/types";
 
 export interface BuildAuthoritativeJourneyParams {
@@ -55,6 +56,7 @@ export interface BuildAuthoritativeJourneyParams {
   documents?: DocumentItem[];
   journey?: ShipmentCustomsJourney | null;
   customerJourney?: import("@/types").CustomerCustomsJourney | null;
+  financialSummary?: ShipmentFinancialSummary | null;
   invoiceReviews?: ShipmentInvoiceReview[];
   pricingHistory?: ShipmentPricingHistoryItem[];
   acidHistory?: ShipmentAcidHistoryItem[];
@@ -244,21 +246,32 @@ export function buildAuthoritativeTenStageJourney(
   const isS8Done =
     st8?.status === "completed" || ["customs_cleared", "delivered"].includes(shipment.status);
 
-  // Stage 09: Settlement of Dues & Customs Duties
+  // Stage 09: Settlement of Dues & Customs Duties (authoritative Migration 0019 ledger first)
+  const financialSummary =
+    params.financialSummary ?? customerJourney?.financialSummary ?? null;
   const settlementData = (st9?.stage_data?.customs_duties_settlement || st9?.stage_data) as
     | CustomsDutiesSettlementData
     | undefined;
+  const legacyResolution =
+    st9?.stage_data &&
+    typeof st9.stage_data === "object" &&
+    "legacy_financial_resolution" in st9.stage_data
+      ? String((st9.stage_data as Record<string, unknown>).legacy_financial_resolution || "")
+      : "";
+  const isLegacyTerminalExempt = legacyResolution === "exempt_terminal_shipment";
   const outstandingDutiesBalance = computeCustomsOutstandingBalance(settlementData);
-  const isS9Done =
-    (st9?.status === "completed" && outstandingDutiesBalance <= 0) ||
-    ["customs_cleared", "delivered"].includes(shipment.status) ||
-    journey?.isFullyCleared === true;
+
+  const isS9Done = isLegacyTerminalExempt
+    ? true
+    : financialSummary
+    ? st9?.status === "completed" && financialSummary.is_financial_settlement_complete
+    : st9?.status === "completed" && outstandingDutiesBalance <= 0;
 
   // Stage 10: Clearance, Release, Exit & Delivery
+  // Terminal 'delivered' counts as S10 done only alongside Stage 9 completion or legacy exemption.
   const isS10Done =
     st10?.status === "completed" ||
-    shipment.status === "delivered" ||
-    (st10?.status === "completed" && !!st10?.reference_number);
+    (shipment.status === "delivered" && isS9Done);
 
   // Pricing display helper (distinguishes estimated range vs final fixed amount)
   const pricingMetaInfo =
@@ -584,12 +597,23 @@ export function buildAuthoritativeTenStageJourney(
       customerDescription: "سداد ومطابقة الرسوم والضرائب الجمركية الرسمية وتوثيق إشعارات السداد البنكي",
       isCompletedRaw: isS9Done,
       isApplicable: true,
-      metaInfo:
-        outstandingDutiesBalance > 0
-          ? `متبقي: ${outstandingDutiesBalance.toLocaleString("ar-EG")} ج.م`
-          : settlementData?.assessed_customs_amount ?? settlementData?.duties_amount
-          ? `رسوم: ${(settlementData?.assessed_customs_amount ?? settlementData?.duties_amount)!.toLocaleString("ar-EG")} ج.م`
-          : null,
+      metaInfo: financialSummary
+        ? financialSummary.pending_direct_customs_payments > 0
+          ? `قيد التحقق: ${financialSummary.pending_direct_customs_payments.toLocaleString("ar-EG")} ج.م`
+          : financialSummary.remaining_customs_obligation > 0
+          ? `متبقي للجمارك: ${financialSummary.remaining_customs_obligation.toLocaleString("ar-EG")} ج.م`
+          : financialSummary.outstanding_balance_to_out > 0
+          ? `متبقي لـ OUT: ${financialSummary.outstanding_balance_to_out.toLocaleString("ar-EG")} ج.م`
+          : financialSummary.assessed_customs_obligation > 0
+          ? `رسوم: ${financialSummary.assessed_customs_obligation.toLocaleString("ar-EG")} ج.م`
+          : financialSummary.is_financial_settlement_complete && isS9Done
+          ? "تمت التسوية بالكامل"
+          : null
+        : outstandingDutiesBalance > 0
+        ? `متبقي: ${outstandingDutiesBalance.toLocaleString("ar-EG")} ج.م`
+        : settlementData?.assessed_customs_amount ?? settlementData?.duties_amount
+        ? `رسوم: ${(settlementData?.assessed_customs_amount ?? settlementData?.duties_amount)!.toLocaleString("ar-EG")} ج.م`
+        : null,
       prerequisiteText: "تتطلب اعتماد التقييم الجمركي وتثبيت السعر النهائي لأتعاب OUT أولاً",
       mappedDbKeys: ["stage_9_fees_payments"],
       dbStageRecord: st9,
@@ -721,7 +745,15 @@ export function buildAuthoritativeTenStageJourney(
           statusLabel = "بانتظار موافقة الجهات الرقابية";
         }
       } else if (def.key === "09_settlement") {
-        if (settlementData?.settlement_status === "paid_by_out_awaiting_customer") {
+        if (financialSummary) {
+          if (financialSummary.outstanding_balance_to_out > 0) {
+            status = "awaiting_external_response";
+            statusLabel = "بانتظار تحصيل المستحقات من العميل";
+          } else if (financialSummary.pending_direct_customs_payments > 0) {
+            status = "in_progress";
+            statusLabel = "بانتظار مراجعة واعتماد إيصال السداد الجمركي";
+          }
+        } else if (settlementData?.settlement_status === "paid_by_out_awaiting_customer") {
           status = "awaiting_external_response";
           statusLabel = "بانتظار تحصيل المستحقات من العميل";
         }
@@ -968,12 +1000,19 @@ export function buildAuthoritativeTenStageJourney(
       targetTab: "documents",
       targetStageNumber: "04",
     };
-  } else if (settlementData?.settlement_status === "paid_by_out_awaiting_customer") {
+  } else if (
+    !isS9Done &&
+    (financialSummary
+      ? financialSummary.outstanding_balance_to_out > 0
+      : settlementData?.settlement_status === "paid_by_out_awaiting_customer")
+  ) {
     primaryCustomerAction = {
       actionType: "settle_duties",
-      title: "تسوية الرسوم الجمركية",
-      description: "سددت OUT الرسوم الجمركية الرسمية وبانتظار تحويل المستحقات لتأكيد التسوية.",
-      buttonLabel: "بيانات التسوية",
+      title: "تسوية الرسوم والمستحقات المالية",
+      description: financialSummary
+        ? `يوجد رصيد مستحق لشركة OUT بقيمة ${financialSummary.outstanding_balance_to_out.toLocaleString("ar-EG")} ج.م لاستكمال التسوية المالية للشحنة.`
+        : "سددت OUT الرسوم الجمركية الرسمية وبانتظار تحويل المستحقات لتأكيد التسوية.",
+      buttonLabel: "عرض كشف المستحقات",
       targetTab: "pricing",
       targetStageNumber: "09",
     };

@@ -47,7 +47,7 @@ export async function adminApproveInvoiceAction(
   formData: FormData,
 ): Promise<InvoiceReviewActionResult> {
   try {
-    const adminUser = await requireRole(["admin", "manager"]);
+    const adminUser = await requireRole(["admin"]);
     const shipmentId = formData.get("shipment_id") as string;
     const documentId = formData.get("document_id") as string;
 
@@ -234,7 +234,7 @@ export async function adminRequestInvoiceRevisionAction(
   formData: FormData,
 ): Promise<InvoiceReviewActionResult> {
   try {
-    const adminUser = await requireRole(["admin", "manager"]);
+    const adminUser = await requireRole(["admin"]);
     const shipmentId = formData.get("shipment_id") as string;
     const documentId = formData.get("document_id") as string;
     const noteRaw = formData.get("note") as string;

@@ -98,8 +98,7 @@ export function isValidUuid(value: unknown): value is string {
 // ─── 2. Server-Side Actor & Shipment Ownership Verification ──────────────────
 
 export async function getDefaultSupabaseClient(): Promise<SupabaseServerClientLike> {
-  const serverModulePath = "../supabase/server";
-  const mod = await import(serverModulePath);
+  const mod = await import("@/lib/supabase/server");
   return mod.createClient();
 }
 

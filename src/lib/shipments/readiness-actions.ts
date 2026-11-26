@@ -41,7 +41,7 @@ import { evaluateShipmentReadiness } from "./readiness";
 /**
  * Server Action: Mark Shipment Ready for External Stage
  *
- * Allowed roles: 'admin', 'manager'
+ * Allowed roles: 'admin'
  * Transitions shipment: 'documents_completed' -> 'ready_for_external_stage'
  * Logs audit event in 'shipment_stage_history'
  */
@@ -50,7 +50,7 @@ export async function markShipmentReadyForExternalStageAction(
 ): Promise<ReadinessActionResult> {
   try {
     // 1. Role Guard
-    const adminUser = await requireRole(["admin", "manager"]);
+    const adminUser = await requireRole(["admin"]);
 
     if (!shipmentId) {
       return { success: false, error: "معرف الشحنة مطلوب." };

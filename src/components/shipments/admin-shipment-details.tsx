@@ -913,54 +913,97 @@ export function AdminShipmentDetails({
                     </div>
                   </div>
 
-                  {pricing?.status === "customer_approved" ? (
-                    <div className="mt-4 p-4 rounded-xl bg-emerald-50 border border-emerald-200 text-xs text-emerald-900 flex items-start gap-2.5">
-                      <DynamicIcon name="CheckCircle" className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                      <div>
-                        <strong>تم اعتماد السعر بنجاح:</strong>
-                        <p className="mt-1">
-                          وافق العميل رسمياً على السعر النهائي ({pricing.final_price?.toLocaleString("ar-EG")} {pricing.currency || "EGP"}){pricing.customer_approved_at && ` بتاريخ ${formatDateAr(pricing.customer_approved_at)}`}.
-                        </p>
-                      </div>
-                    </div>
-                  ) : (
-                    <form onSubmit={handleAdminSetFinalPrice} className="space-y-3 pt-3">
-                      {(shipment.status === "negotiation" || pricing?.status === "negotiation_requested") && (
-                        <div className="p-2.5 rounded-lg bg-amber-50 border border-amber-200 text-[11px] text-amber-900 font-medium">
-                          ⚠️ العميل طلب التفاوض على السعر. يرجى التواصل معه هاتفياً وتسجيل السعر المتفق عليه.
-                        </div>
-                      )}
+                  {(() => {
+                    const s9Stage = authoritativeJourney.stages.find((s) => s.key === "09_settlement");
+                    const isFinalPriceLockedBySettlement =
+                      !!s9Stage?.isCompleted || ["customs_cleared", "delivered"].includes(shipment.status);
+                    const isApprovedFinalFixed =
+                      pricing?.status === "customer_approved" && pricing?.approval_type === "final_fixed";
+                    const isApprovedRangeOnly =
+                      pricing?.status === "customer_approved" && pricing?.approval_type === "estimated_range";
 
-                      <div>
-                        <label className="block text-xs font-bold text-neutral-700 mb-1">
-                          السعر النهائي المتفق عليه ({pricingCurrency}):
-                        </label>
-                        <input
-                          type="number"
-                          min="1"
-                          step="1"
-                          required
-                          value={finalPriceInput}
-                          onChange={(e) => setFinalPriceInput(e.target.value)}
-                          placeholder="مثال: 4500"
-                          className="w-full text-xs p-2.5 rounded-xl border border-neutral-300 font-mono focus:border-neutral-900 focus:outline-hidden"
-                        />
-                      </div>
+                    return (
+                      <div className="mt-4 space-y-3">
+                        {isApprovedFinalFixed && (
+                          <div className="p-4 rounded-xl bg-emerald-50 border border-emerald-200 text-xs text-emerald-900 flex items-start gap-2.5">
+                            <DynamicIcon name="CheckCircle" className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                            <div>
+                              <strong>تم اعتماد السعر النهائي بنجاح:</strong>
+                              <p className="mt-1">
+                                وافق العميل رسمياً على السعر النهائي ({pricing.final_price?.toLocaleString("ar-EG")} {pricing.currency || "EGP"}){pricing.customer_approved_at && ` بتاريخ ${formatDateAr(pricing.customer_approved_at)}`}.
+                              </p>
+                            </div>
+                          </div>
+                        )}
 
-                      <button
-                        type="submit"
-                        disabled={isPending || !finalPriceInput}
-                        className="w-full py-2.5 bg-neutral-950 hover:bg-neutral-900 text-[#F5C500] font-bold rounded-xl text-xs transition-all shadow-xs border border-neutral-800 cursor-pointer disabled:opacity-50 flex items-center justify-center gap-1.5 focus-visible:ring-2 focus-visible:ring-neutral-950"
-                      >
-                        <DynamicIcon name="Check" className="w-3.5 h-3.5" />
-                        <span>{isPending ? "جاري الحفظ..." : "تسجيل السعر النهائي وإرساله للعميل"}</span>
-                      </button>
-                    </form>
-                  )}
+                        {isApprovedRangeOnly && (
+                          <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-[11px] text-amber-900">
+                            وافق العميل على النطاق التقديري المبدئي. يمكنك الآن تحديد السعر النهائي الثابت وإرساله لاعتماد العميل.
+                          </div>
+                        )}
+
+                        {!isFinalPriceLockedBySettlement && (
+                          <form onSubmit={handleAdminSetFinalPrice} className="space-y-3 pt-1">
+                            {(shipment.status === "negotiation" || pricing?.status === "negotiation_requested") && (
+                              <div className="p-2.5 rounded-lg bg-amber-50 border border-amber-200 text-[11px] text-amber-900 font-medium">
+                                ⚠️ العميل طلب التفاوض على السعر. يرجى التواصل معه هاتفياً وتسجيل السعر المتفق عليه.
+                              </div>
+                            )}
+
+                            {isApprovedFinalFixed && (
+                              <div className="p-2.5 rounded-lg bg-yellow-50 border border-yellow-200 text-[11px] text-neutral-800">
+                                ملاحظة: تعديل السعر النهائي هنا يلغي الاعتماد السابق ويُعيد السعر لحالة انتظار موافقة العميل قبل إغلاق التسوية المالية.
+                              </div>
+                            )}
+
+                            <div>
+                              <label className="block text-xs font-bold text-neutral-700 mb-1">
+                                {isApprovedFinalFixed
+                                  ? `تعديل السعر النهائي (${pricingCurrency}):`
+                                  : `السعر النهائي المتفق عليه (${pricingCurrency}):`}
+                              </label>
+                              <input
+                                type="number"
+                                min="1"
+                                step="1"
+                                required
+                                value={finalPriceInput}
+                                onChange={(e) => setFinalPriceInput(e.target.value)}
+                                placeholder="مثال: 4500"
+                                className="w-full text-xs p-2.5 rounded-xl border border-neutral-300 font-mono focus:border-neutral-900 focus:outline-hidden"
+                              />
+                            </div>
+
+                            <button
+                              type="submit"
+                              disabled={isPending || !finalPriceInput}
+                              className="w-full py-2.5 bg-neutral-950 hover:bg-neutral-900 text-[#F5C500] font-bold rounded-xl text-xs transition-all shadow-xs border border-neutral-800 cursor-pointer disabled:opacity-50 flex items-center justify-center gap-1.5 focus-visible:ring-2 focus-visible:ring-neutral-950"
+                            >
+                              <DynamicIcon name="Check" className="w-3.5 h-3.5" />
+                              <span>
+                                {isPending
+                                  ? "جاري الحفظ..."
+                                  : isApprovedFinalFixed
+                                  ? "تحديث السعر النهائي وإرساله للعميل"
+                                  : "تسجيل السعر النهائي وإرساله للعميل"}
+                              </span>
+                            </button>
+                          </form>
+                        )}
+                      </div>
+                    );
+                  })()}
                 </div>
 
                 <div className="text-[11px] text-neutral-400 border-t border-neutral-100 pt-3">
-                  الحالة: {pricing?.status === "customer_approved" ? "معتمد" : pricing?.final_price ? "بانتظار موافقة العميل" : "بانتظار الاتفاق"}
+                  الحالة:{" "}
+                  {pricing?.status === "customer_approved" && pricing?.approval_type === "final_fixed"
+                    ? "سعر نهائي معتمد"
+                    : pricing?.status === "customer_approved"
+                    ? "نطاق تقديري معتمد (بانتظار تحديد السعر النهائي)"
+                    : pricing?.status === "final_proposed" || pricing?.final_price
+                    ? "بانتظار موافقة العميل على السعر النهائي"
+                    : "بانتظار الاتفاق"}
                 </div>
               </div>
             </div>

@@ -13,6 +13,8 @@
 
 import { createClient } from "@/lib/supabase/server";
 import { requireRole } from "@/lib/auth/guards";
+import { getShipmentFinancialSummaryQuery } from "./financial-queries";
+import type { ShipmentFinancialSummary } from "@/types/financial";
 import {
   CustomsStageKey,
   CustomsStageStatus,
@@ -39,8 +41,10 @@ import { matchFinalDocumentType, FINAL_SHIPMENT_DOCUMENT_TYPES } from "@/types";
 export async function getShipmentCustomsJourney(
   shipmentId: string,
 ): Promise<ShipmentCustomsJourney | null> {
-  await requireRole(["admin", "manager", "data_entry", "inspector", "scout"]);
-  return getShipmentCustomsJourneyInternal(shipmentId, { allowBackgroundInit: true });
+  const currentUser = await requireRole(["admin", "manager", "data_entry", "inspector", "scout"]);
+  return getShipmentCustomsJourneyInternal(shipmentId, {
+    allowBackgroundInit: currentUser.role !== "manager",
+  });
 }
 
 export async function getShipmentCustomsJourneyInternal(
@@ -609,9 +613,9 @@ export async function getCustomerShipmentCustomsJourney(
   });
   if (!journey) return null;
 
-  // 3. Fetch customer pricing, invoice review, and document contexts
+  // 3. Fetch customer pricing, invoice review, document contexts, and authoritative financial summary
   //    Fixed: shipment_invoice_reviews columns are (action, note, performed_at)
-  const [pricingRes, acidRes, docsRes, invoiceReviewsRes] = await Promise.all([
+  const [pricingRes, acidRes, docsRes, invoiceReviewsRes, financialSummaryRes] = await Promise.all([
     supabase
       .from("shipment_pricing")
       .select(
@@ -634,7 +638,13 @@ export async function getCustomerShipmentCustomsJourney(
       .eq("shipment_id", shipmentId)
       .order("performed_at", { ascending: false })
       .limit(1),
+    getShipmentFinancialSummaryQuery(shipmentId),
   ]);
+
+  const financialSummary: ShipmentFinancialSummary | null =
+    financialSummaryRes.success && financialSummaryRes.data
+      ? financialSummaryRes.data
+      : null;
 
   const pricing = pricingRes.data as {
     status?: string;
@@ -709,31 +719,56 @@ export async function getCustomerShipmentCustomsJourney(
         approvedPublicReference = `رقم 46: ${effectiveForm46.number}`;
       }
     } else if (st.stage_key === "stage_9_fees_payments") {
-      const settlement = (st.stage_data?.customs_duties_settlement ||
-        st.stage_data) as CustomsDutiesSettlementData | undefined;
-      const assessedAmount =
-        settlement?.assessed_customs_amount ?? settlement?.duties_amount;
-      if (settlement?.settlement_status === "customer_paid_direct") {
-        const directRef =
-          settlement.customer_direct_payment_reference || st.reference_number;
-        approvedPublicReference = directRef
-          ? `سداد مباشر بإيصال: ${directRef}`
-          : "تم السداد المباشر من العميل لمصلحة الجمارك";
-      } else if (
-        settlement?.settlement_status === "settled" &&
-        st.status === "completed"
-      ) {
-        approvedPublicReference =
-          assessedAmount && assessedAmount > 0
+      if (financialSummary) {
+        const assessedAmount =
+          financialSummary.assessed_customs_obligation > 0
+            ? financialSummary.assessed_customs_obligation
+            : null;
+        if (financialSummary.is_financial_settlement_complete && st.status === "completed") {
+          approvedPublicReference = assessedAmount
             ? `تمت التسوية المالية بالكامل (${assessedAmount.toLocaleString("ar-EG")} ج.م)`
             : "تمت التسوية المالية بالكامل";
-      } else if (assessedAmount && assessedAmount > 0) {
-        approvedPublicReference = `الرسوم الرسمية المقررة: ${assessedAmount.toLocaleString("ar-EG")} ج.م`;
-      }
-      if (settlement?.settlement_status === "paid_by_out_awaiting_customer") {
-        isWaitingForCustomer = true;
-        customerActionRequired =
-          "سددت OUT الرسوم الجمركية وبانتظار تحويل المستحقات لحساب الشركة";
+        } else if (financialSummary.outstanding_balance_to_out > 0) {
+          approvedPublicReference = `المستحقات المتبقية لشركة OUT: ${financialSummary.outstanding_balance_to_out.toLocaleString("ar-EG")} ج.م`;
+          isWaitingForCustomer = true;
+          customerActionRequired = `يوجد رصيد مستحق لشركة OUT بقيمة ${financialSummary.outstanding_balance_to_out.toLocaleString("ar-EG")} ج.م`;
+        } else if (financialSummary.pending_direct_customs_payments > 0) {
+          approvedPublicReference = `إشعار سداد جمركي قيد التحقق: ${financialSummary.pending_direct_customs_payments.toLocaleString("ar-EG")} ج.م`;
+        } else if (
+          financialSummary.verified_direct_customs_payments > 0 &&
+          financialSummary.remaining_customs_obligation <= 0
+        ) {
+          approvedPublicReference = `تم السداد المباشر للجمارك (${financialSummary.verified_direct_customs_payments.toLocaleString("ar-EG")} ج.م)`;
+        } else if (assessedAmount) {
+          approvedPublicReference = `الرسوم الرسمية المقررة: ${assessedAmount.toLocaleString("ar-EG")} ج.م`;
+        }
+      } else {
+        const settlement = (st.stage_data?.customs_duties_settlement ||
+          st.stage_data) as CustomsDutiesSettlementData | undefined;
+        const assessedAmount =
+          settlement?.assessed_customs_amount ?? settlement?.duties_amount;
+        if (settlement?.settlement_status === "customer_paid_direct") {
+          const directRef =
+            settlement.customer_direct_payment_reference || st.reference_number;
+          approvedPublicReference = directRef
+            ? `سداد مباشر بإيصال: ${directRef}`
+            : "تم السداد المباشر من العميل لمصلحة الجمارك";
+        } else if (
+          settlement?.settlement_status === "settled" &&
+          st.status === "completed"
+        ) {
+          approvedPublicReference =
+            assessedAmount && assessedAmount > 0
+              ? `تمت التسوية المالية بالكامل (${assessedAmount.toLocaleString("ar-EG")} ج.م)`
+              : "تمت التسوية المالية بالكامل";
+        } else if (assessedAmount && assessedAmount > 0) {
+          approvedPublicReference = `الرسوم الرسمية المقررة: ${assessedAmount.toLocaleString("ar-EG")} ج.م`;
+        }
+        if (settlement?.settlement_status === "paid_by_out_awaiting_customer") {
+          isWaitingForCustomer = true;
+          customerActionRequired =
+            "سددت OUT الرسوم الجمركية وبانتظار تحويل المستحقات لحساب الشركة";
+        }
       }
     } else if (st.stage_key === "stage_10_clearance_release") {
       const releaseData = st.stage_data as
@@ -833,6 +868,7 @@ export async function getCustomerShipmentCustomsJourney(
     applicableStagesCount: journey.applicableStagesCount,
     progressPercentage: journey.progressPercentage,
     isFullyCleared: journey.isFullyCleared,
+    financialSummary,
     primaryActionRequired: primaryAction,
   };
 }

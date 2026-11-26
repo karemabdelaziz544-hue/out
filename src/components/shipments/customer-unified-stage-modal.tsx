@@ -33,6 +33,7 @@ import type {
   FinalShipmentDocumentType,
 } from "@/types";
 import { FINAL_SHIPMENT_DOCUMENT_TYPES, FINAL_DOCUMENT_TYPE_LABELS, matchFinalDocumentType } from "@/types";
+import type { ShipmentFinancialSummary } from "@/types/financial";
 
 // Customer Server Actions
 import {
@@ -54,6 +55,7 @@ interface CustomerUnifiedStageModalProps {
   acid?: ShipmentAcid | null;
   documents?: DocumentItem[];
   journey?: ShipmentCustomsJourney | null;
+  financialSummary?: ShipmentFinancialSummary | null;
   onPreviewDocument?: (doc: DocumentItem) => void;
 }
 
@@ -68,6 +70,7 @@ export function CustomerUnifiedStageModal({
   acid = null,
   documents = [],
   journey = null,
+  financialSummary = null,
   onPreviewDocument,
 }: CustomerUnifiedStageModalProps) {
   const [isPending, startTransition] = useTransition();
@@ -740,27 +743,60 @@ export function CustomerUnifiedStageModal({
 
               {/* Public Milestone Status for Customer */}
               <div className="space-y-2 pt-1">
-                {(stage9Settlement?.assessed_customs_amount ?? stage9Settlement?.duties_amount) && (
-                  <div className="p-3 bg-neutral-50 rounded-xl border border-neutral-200 flex items-center justify-between text-xs">
-                    <div className="flex items-center gap-2 text-neutral-800 font-bold">
-                      <DynamicIcon name="Receipt" className="w-4 h-4 text-amber-600" />
-                      <span>إجمالي الرسوم الجمركية المقررة</span>
+                {financialSummary ? (
+                  <>
+                    <div className="p-3 bg-neutral-50 rounded-xl border border-neutral-200 flex items-center justify-between text-xs">
+                      <div className="flex items-center gap-2 text-neutral-800 font-bold">
+                        <DynamicIcon name="Receipt" className="w-4 h-4 text-amber-600" />
+                        <span>إجمالي الرسوم الجمركية المقررة</span>
+                      </div>
+                      <span className="text-[11px] font-mono font-bold text-neutral-900">
+                        {financialSummary.assessed_customs_obligation.toLocaleString("ar-EG")} ج.م
+                      </span>
                     </div>
-                    <span className="text-[11px] font-mono font-bold text-neutral-900">
-                      {(stage9Settlement?.assessed_customs_amount ?? stage9Settlement?.duties_amount)?.toLocaleString("ar-EG")} ج.م
-                    </span>
-                  </div>
-                )}
-                {stage9Settlement?.settlement_status === "customer_paid_direct" && (
-                  <div className="p-3 bg-emerald-50 rounded-xl border border-emerald-200 flex items-center justify-between text-xs">
-                    <div className="flex items-center gap-2 text-emerald-800 font-bold">
-                      <DynamicIcon name="CheckCircle" className="w-4 h-4 text-emerald-600" />
-                      <span>حالة تسوية الرسوم الجمركية</span>
+                    <div className="p-3 bg-neutral-50 rounded-xl border border-neutral-200 flex items-center justify-between text-xs">
+                      <span className="text-neutral-700 font-bold">الرصيد المتبقي لشركة OUT</span>
+                      <span className="text-[11px] font-mono font-bold text-neutral-900">
+                        {financialSummary.outstanding_balance_to_out.toLocaleString("ar-EG")} ج.م
+                      </span>
                     </div>
-                    <span className="text-[11px] font-bold text-emerald-700">
-                      مسددة مباشرة لمصلحة الجمارك ✅
-                    </span>
-                  </div>
+                    {financialSummary.is_financial_settlement_complete && (
+                      <div className="p-3 bg-emerald-50 rounded-xl border border-emerald-200 flex items-center justify-between text-xs">
+                        <div className="flex items-center gap-2 text-emerald-800 font-bold">
+                          <DynamicIcon name="CheckCircle" className="w-4 h-4 text-emerald-600" />
+                          <span>حالة التسوية المالية</span>
+                        </div>
+                        <span className="text-[11px] font-bold text-emerald-700">
+                          مسوية ومعتمدة بالكامل ✅
+                        </span>
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    {(stage9Settlement?.assessed_customs_amount ?? stage9Settlement?.duties_amount) && (
+                      <div className="p-3 bg-neutral-50 rounded-xl border border-neutral-200 flex items-center justify-between text-xs">
+                        <div className="flex items-center gap-2 text-neutral-800 font-bold">
+                          <DynamicIcon name="Receipt" className="w-4 h-4 text-amber-600" />
+                          <span>إجمالي الرسوم الجمركية المقررة</span>
+                        </div>
+                        <span className="text-[11px] font-mono font-bold text-neutral-900">
+                          {(stage9Settlement?.assessed_customs_amount ?? stage9Settlement?.duties_amount)?.toLocaleString("ar-EG")} ج.م
+                        </span>
+                      </div>
+                    )}
+                    {stage9Settlement?.settlement_status === "customer_paid_direct" && (
+                      <div className="p-3 bg-emerald-50 rounded-xl border border-emerald-200 flex items-center justify-between text-xs">
+                        <div className="flex items-center gap-2 text-emerald-800 font-bold">
+                          <DynamicIcon name="CheckCircle" className="w-4 h-4 text-emerald-600" />
+                          <span>حالة تسوية الرسوم الجمركية</span>
+                        </div>
+                        <span className="text-[11px] font-bold text-emerald-700">
+                          مسددة مباشرة لمصلحة الجمارك ✅
+                        </span>
+                      </div>
+                    )}
+                  </>
                 )}
                 {stage10Data?.customs_released_at && (
                   <div className="p-3 bg-neutral-50 rounded-xl border border-neutral-200 flex items-center justify-between text-xs">

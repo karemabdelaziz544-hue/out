@@ -921,6 +921,7 @@ export interface CustomerCustomsJourney {
   applicableStagesCount: number;
   progressPercentage: number;
   isFullyCleared: boolean;
+  financialSummary?: import("./financial").ShipmentFinancialSummary | null;
   primaryActionRequired: {
     actionType: "approve_price" | "upload_documents" | "revise_invoice" | "correct_document" | null;
     title: string;

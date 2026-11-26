@@ -28,8 +28,7 @@ import {
 } from "@/types/journey";
 import { matchFinalDocumentType } from "@/types";
 import { createNotification } from "@/lib/notifications/queries";
-import { evaluateStage9FinancialGate } from "./financial-calculations";
-import { getShipmentFinancialSummaryQuery } from "./financial-queries";
+import { getStage9FinancialGateStatusQuery } from "./financial-queries";
 import {
   STAGE_WORKFLOW_RULES,
   isStageApplicable,
@@ -70,7 +69,7 @@ export async function updateShipmentClassificationAction(
   formData: FormData,
 ): Promise<JourneyActionResult> {
   try {
-    await requireRole(["admin", "manager"]);
+    await requireRole(["admin"]);
     const user = await getCurrentUser();
     if (!user) {
       return { success: false, error: "يجب تسجيل الدخول لتحديث تصنيف الشحنة." };
@@ -329,7 +328,7 @@ export async function updateShipmentRegulatoryProcedureAction(
   formData: FormData,
 ): Promise<JourneyActionResult> {
   try {
-    await requireRole(["admin", "manager", "inspector"]);
+    await requireRole(["admin", "inspector"]);
     const user = await getCurrentUser();
     if (!user) {
       return { success: false, error: "يجب تسجيل الدخول لتحديث الإجراء الرقابي." };
@@ -423,7 +422,7 @@ export async function updateCustomsStageAction(
   explicitStageData?: Record<string, unknown>,
 ): Promise<JourneyActionResult> {
   try {
-    await requireRole(["admin", "manager", "data_entry", "inspector", "scout"]);
+    await requireRole(["admin", "data_entry", "inspector", "scout"]);
     const user = await getCurrentUser();
     if (!user) {
       return { success: false, error: "يجب تسجيل الدخول لتحديث مراحل التخليص." };
@@ -540,18 +539,15 @@ export async function updateCustomsStageAction(
 
     const stageDef = CUSTOMS_STAGE_DEFINITIONS[stageKey];
 
-    // ─── Enforce Role Authorization per Stage (Including Manager Read-Only on Financial Stages) ───
-    if (
-      user.role === "manager" &&
-      (stageKey === "stage_2_pricing" || stageKey === "stage_9_fees_payments")
-    ) {
+    // ─── Enforce Role Authorization per Stage (Manager is strictly Read-Only) ───
+    if (user.role === "manager") {
       return {
         success: false,
-        error: "صلاحية المدير (Manager) قراءة فقط للبيانات والمراحل المالية؛ لا يُسمح بتعديل أو إغلاق هذه المرحلة.",
+        error: "صلاحية المدير (Manager) قراءة فقط؛ لا يُسمح بتعديل أو إغلاق مراحل التخليص الجمركي.",
       };
     }
 
-    const isSuperAdmin = user.role === "admin" || user.role === "manager";
+    const isSuperAdmin = user.role === "admin";
     if (!isSuperAdmin) {
       if (stageDef.expectedRole !== user.role) {
         return {
@@ -599,25 +595,53 @@ export async function updateCustomsStageAction(
     }
 
     // ─── Authoritative Financial Gate Enforcement for Stage 9 and Stage 10 ───
-    if (
-      (stageKey === "stage_9_fees_payments" || stageKey === "stage_10_clearance_release") &&
-      status === "completed"
-    ) {
-      const summaryRes = await getShipmentFinancialSummaryQuery(shipmentId, {
+    // Block Stage 9 completion AND any Stage 10 completion or release/exit/delivery milestone
+    // unless Stage 9 is settled and (for Stage 10) already completed.
+    const isRecordingStage10Milestone =
+      stageKey === "stage_10_clearance_release" &&
+      (status === "completed" ||
+        Boolean(stageData.release_permit_number) ||
+        Boolean(stageData.customs_released_at) ||
+        (!clearPortExit && Boolean(stageData.port_exit_at)) ||
+        (!clearDelivery && Boolean(stageData.delivered_at)) ||
+        Boolean(referenceNumber));
+
+    const requiresFinancialGate =
+      (stageKey === "stage_9_fees_payments" && status === "completed") ||
+      isRecordingStage10Milestone;
+
+    if (requiresFinancialGate) {
+      const gateRes = await getStage9FinancialGateStatusQuery(shipmentId, {
         supabase,
       });
 
-      if (!summaryRes.success || !summaryRes.data) {
+      if (!gateRes.success || !gateRes.data) {
         return {
           success: false,
           error:
-            summaryRes.error ||
+            gateRes.error ||
             "تعذر التحقق من استيفاء البوابة المالية للشحنة قبل إغلاق المرحلة.",
         };
       }
 
-      const gate = evaluateStage9FinancialGate(summaryRes.data);
-      if (!gate.canComplete || !summaryRes.data.is_financial_settlement_complete) {
+      const { gate, summary, stageStatus: stage9Status, isLegacyTerminalExempt } = gateRes.data;
+
+      if (
+        stageKey === "stage_10_clearance_release" &&
+        stage9Status !== "completed" &&
+        !isLegacyTerminalExempt
+      ) {
+        return {
+          success: false,
+          error:
+            "لا يمكن تسجيل الإفراج أو إغلاق المرحلة العاشرة قبل اكتمال واعتماد المرحلة التاسعة (الرسوم الجمركية والمدفوعات).",
+        };
+      }
+
+      if (
+        !isLegacyTerminalExempt &&
+        (!gate.canComplete || !summary.is_financial_settlement_complete)
+      ) {
         return {
           success: false,
           error:
@@ -754,6 +778,17 @@ export async function updateCustomsStageAction(
       ...stageData,
     };
 
+    if (stageKey === "stage_9_fees_payments") {
+      delete mergedStageData.customs_duties_settlement;
+      delete mergedStageData.assessed_customs_amount;
+      delete mergedStageData.duties_amount;
+      delete mergedStageData.amount_paid_by_out;
+      delete mergedStageData.duties_paid_by_out;
+      delete mergedStageData.amount_collected_from_customer;
+      delete mergedStageData.collected_from_customer;
+      delete mergedStageData.settlement_status;
+    }
+
     if (stageKey === "stage_10_clearance_release") {
       if (clearPortExit) {
         mergedStageData.port_exit_at = null;
@@ -783,6 +818,7 @@ export async function updateCustomsStageAction(
       referenceNumber: referenceNumber || existingStage?.reference_number || null,
       notes,
       rejectionOrDelayReason,
+      isFinancialLedgerSettled: stageKey === "stage_9_fees_payments" && status === "completed",
     });
 
     if (!validation.valid) {
@@ -1138,7 +1174,7 @@ export async function reopenCustomsStageAction(
   formData: FormData,
 ): Promise<JourneyActionResult> {
   try {
-    await requireRole(["admin", "manager"]);
+    await requireRole(["admin"]);
     const user = await getCurrentUser();
     if (!user) {
       return { success: false, error: "يجب تسجيل الدخول لإعادة فتح المرحلة." };
@@ -1300,7 +1336,7 @@ export async function updateStageChecklistItemAction(
   formData: FormData,
 ): Promise<JourneyActionResult> {
   try {
-    await requireRole(["admin", "manager", "data_entry", "inspector", "scout"]);
+    await requireRole(["admin", "data_entry", "inspector", "scout"]);
     const user = await getCurrentUser();
     if (!user) {
       return { success: false, error: "يجب تسجيل الدخول لتحديث بنود التدقيق." };
@@ -1326,7 +1362,7 @@ export async function updateStageChecklistItemAction(
       return { success: false, error: "المرحلة غير صالحة." };
     }
 
-    const isSuperAdmin = user.role === "admin" || user.role === "manager";
+    const isSuperAdmin = user.role === "admin";
     if (!isSuperAdmin && stageDef.expectedRole !== user.role) {
       return {
         success: false,

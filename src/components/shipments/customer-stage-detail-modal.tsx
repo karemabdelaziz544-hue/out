@@ -6,6 +6,11 @@ import { DynamicIcon } from "@/components/ui/icon";
 import { formatDateAr } from "@/lib/utils";
 import type { AuthoritativeJourneyStage, CustomerJourneyStation } from "@/types/journey";
 import type { DocumentItem, ShipmentPricing, ShipmentAcid, Shipment, FinalShipmentDocumentType } from "@/types";
+import type {
+  CustomerCustomsObligationItem,
+  CustomerShipmentFinancialStatementItem,
+  ShipmentFinancialSummary,
+} from "@/types/financial";
 import {
   FINAL_SHIPMENT_DOCUMENT_TYPES,
   FINAL_DOCUMENT_TYPE_LABELS,
@@ -28,6 +33,9 @@ interface CustomerStageDetailModalProps {
   documents: DocumentItem[];
   pricing?: ShipmentPricing | null;
   acid?: ShipmentAcid | null;
+  financialSummary?: ShipmentFinancialSummary | null;
+  financialStatement?: CustomerShipmentFinancialStatementItem[];
+  customsObligations?: CustomerCustomsObligationItem[];
   onPreviewDocument?: (doc: DocumentItem) => void;
   onActionClick?: (tab: "documents" | "pricing" | "specs") => void;
 }
@@ -47,7 +55,11 @@ function CustomerStageDetailModalContent({
   documents,
   pricing = null,
   acid = null,
+  financialSummary = null,
+  financialStatement = [],
+  customsObligations = [],
   onPreviewDocument,
+  onActionClick,
 }: CustomerStageDetailModalProps) {
   // Close on Escape key
   useEffect(() => {
@@ -358,42 +370,46 @@ function CustomerStageDetailModalContent({
                 </div>
                 <span
                   className={`text-[11px] font-bold px-2.5 py-0.5 rounded-md border ${
-                    pricing?.status === "customer_approved"
+                    pricing?.status === "customer_approved" && pricing?.approval_type === "final_fixed"
                       ? "bg-emerald-50 text-emerald-800 border-emerald-300"
                       : pricing?.status === "negotiation_requested" || shipment?.status === "negotiation"
                       ? "bg-amber-50 text-amber-800 border-amber-300"
-                      : pricing?.final_price || shipment?.status === "price_agreed"
+                      : pricing?.status === "final_proposed" || pricing?.final_price || shipment?.status === "price_agreed"
                       ? "bg-blue-50 text-blue-800 border-blue-300"
+                      : pricing?.status === "customer_approved" && pricing?.approval_type === "estimated_range"
+                      ? "bg-emerald-50 text-emerald-800 border-emerald-300"
                       : pricing?.estimated_min_price
                       ? "bg-yellow-50 text-yellow-800 border-yellow-300"
                       : "bg-neutral-100 text-neutral-600 border-neutral-300"
                   }`}
                 >
-                  {pricing?.status === "customer_approved"
-                    ? "تمت الموافقة على التسعير ✓"
+                  {pricing?.status === "customer_approved" && pricing?.approval_type === "final_fixed"
+                    ? "تمت الموافقة على السعر النهائي ✓"
                     : pricing?.status === "negotiation_requested" || shipment?.status === "negotiation"
                     ? "طلب التفاوض على السعر"
-                    : pricing?.final_price || shipment?.status === "price_agreed"
+                    : pricing?.status === "final_proposed" || pricing?.final_price || shipment?.status === "price_agreed"
                     ? "تم تحديد السعر النهائي"
+                    : pricing?.status === "customer_approved" && pricing?.approval_type === "estimated_range"
+                    ? "تم اعتماد النطاق التقديري ✓"
                     : pricing?.estimated_min_price
                     ? "في انتظار موافقة العميل"
                     : "قيد إعداد عرض السعر"}
                 </span>
               </div>
 
-              {/* State 1: Customer Approved */}
-              {pricing?.status === "customer_approved" || pricing?.customer_approved_at ? (
+              {/* State 1: Customer Approved Final Fixed Price */}
+              {pricing?.status === "customer_approved" && pricing?.approval_type === "final_fixed" ? (
                 <div className="p-3 bg-emerald-50 rounded-xl border border-emerald-200 text-xs text-emerald-900 space-y-1">
                   <div className="flex items-center gap-1.5 font-bold">
                     <DynamicIcon name="CheckCircle" className="w-4 h-4 text-emerald-600 shrink-0" />
-                    <span>تم اعتماد السعر بنجاح</span>
+                    <span>تم اعتماد السعر النهائي بنجاح</span>
                   </div>
                   <p className="text-[11px] text-emerald-800">
-                    السعر المعتمد: {pricing.final_price?.toLocaleString("ar-EG") || pricing.estimated_min_price?.toLocaleString("ar-EG")} {pricing.currency || "EGP"}
+                    السعر المعتمد: {pricing.final_price?.toLocaleString("ar-EG")} {pricing.currency || "EGP"}
                     {pricing.customer_approved_at && ` • بتاريخ ${formatDateAr(pricing.customer_approved_at)}`}
                   </p>
                 </div>
-              ) : pricing?.final_price || shipment?.status === "price_agreed" ? (
+              ) : pricing?.status === "final_proposed" || pricing?.final_price || shipment?.status === "price_agreed" ? (
                 /* State 2: Final Price Set by Admin -> Client Approves */
                 <div className="space-y-3">
                   <div className="p-3 bg-blue-50/70 border border-blue-200 rounded-xl">
@@ -415,6 +431,16 @@ function CustomerStageDetailModalContent({
                     <DynamicIcon name="Check" className="w-3.5 h-3.5" />
                     <span>{isPending ? "جاري الاعتماد..." : "اعتماد وموافقة على السعر النهائي"}</span>
                   </button>
+                </div>
+              ) : pricing?.status === "customer_approved" && pricing?.approval_type === "estimated_range" ? (
+                <div className="p-3 bg-emerald-50 rounded-xl border border-emerald-200 text-xs text-emerald-900 space-y-1">
+                  <div className="flex items-center gap-1.5 font-bold">
+                    <DynamicIcon name="CheckCircle" className="w-4 h-4 text-emerald-600 shrink-0" />
+                    <span>تم اعتماد النطاق التقديري المبدئي</span>
+                  </div>
+                  <p className="text-[11px] text-emerald-800">
+                    النطاق المعتمد: {pricing.estimated_min_price.toLocaleString("ar-EG")} - {pricing.estimated_max_price.toLocaleString("ar-EG")} {pricing.currency || "EGP"}
+                  </p>
                 </div>
               ) : pricing?.status === "negotiation_requested" || shipment?.status === "negotiation" ? (
                 /* State 3: Client Requested Negotiation */
@@ -721,12 +747,70 @@ function CustomerStageDetailModalContent({
 
           {/* Station 06: Duties Settlement info for Customer */}
           {isValuationSettlementStation && (
-            <div className="p-4 bg-neutral-50 rounded-2xl border border-neutral-200 flex flex-col gap-2 text-xs">
-              <span className="font-bold text-neutral-900">التقييم الجمركي وسداد الرسوم:</span>
-              <p className="text-neutral-600 text-[11px] leading-relaxed">
-                يتم احتساب الرسوم الجمركية والضرائب المقررة رسمياً، وسدادها مباشرة أو عبر حساب شركة
-                OUT بالنيابة وتوثيق إيصال السداد البنكي لإنهاء متطلبات الإفراج.
-              </p>
+            <div className="p-4 bg-neutral-50 rounded-2xl border border-neutral-200 flex flex-col gap-3 text-xs">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-bold text-neutral-900">التقييم الجمركي وسداد الرسوم:</span>
+                {financialSummary && (
+                  <span
+                    className={`text-[10px] font-bold px-2 py-0.5 rounded border ${
+                      financialSummary.is_financial_settlement_complete
+                        ? "bg-emerald-50 text-emerald-800 border-emerald-200"
+                        : "bg-yellow-50 text-neutral-900 border-yellow-300"
+                    }`}
+                  >
+                    {financialSummary.is_financial_settlement_complete ? "مكتملة التسوية" : "قيد المتابعة"}
+                  </span>
+                )}
+              </div>
+
+              {financialSummary ? (
+                <div className="space-y-1.5 text-[11px]">
+                  <div className="flex justify-between">
+                    <span className="text-neutral-600">الرسوم الجمركية المقررة ({customsObligations.length} مطالبة):</span>
+                    <strong className="font-mono text-neutral-950">
+                      {financialSummary.assessed_customs_obligation.toLocaleString("ar-EG")} ج.م
+                    </strong>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-neutral-600">المتبقي على المطالبات الجمركية:</span>
+                    <strong className="font-mono text-neutral-950">
+                      {financialSummary.remaining_customs_obligation.toLocaleString("ar-EG")} ج.م
+                    </strong>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-neutral-600">إجمالي المستحق لـ OUT (يشمل الأتعاب المعتمدة):</span>
+                    <strong className="font-mono text-neutral-950">
+                      {financialSummary.total_customer_receivable_to_out.toLocaleString("ar-EG")} ج.م
+                    </strong>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-neutral-600">الرصيد المتبقي لشركة OUT:</span>
+                    <strong className="font-mono text-neutral-950">
+                      {financialSummary.outstanding_balance_to_out.toLocaleString("ar-EG")} ج.م
+                    </strong>
+                  </div>
+                  {financialStatement.length > 0 && (
+                    <p className="text-neutral-500 pt-1">
+                      الحركات المالية المعتمدة المسجلة في كشف الحساب: {financialStatement.length} حركة.
+                    </p>
+                  )}
+                </div>
+              ) : (
+                <p className="text-neutral-600 text-[11px] leading-relaxed">
+                  يتم احتساب الرسوم الجمركية والضرائب المقررة رسمياً، وسدادها مباشرة أو عبر حساب شركة
+                  OUT بالنيابة وتوثيق إيصال السداد البنكي لإنهاء متطلبات الإفراج.
+                </p>
+              )}
+
+              {onActionClick && (
+                <button
+                  type="button"
+                  onClick={() => onActionClick("pricing")}
+                  className="self-start px-3.5 py-2 rounded-xl bg-neutral-950 hover:bg-neutral-900 text-[#F5C500] font-bold text-[11px] transition-colors cursor-pointer"
+                >
+                  عرض كشف الحساب المالي الكامل
+                </button>
+              )}
             </div>
           )}
 

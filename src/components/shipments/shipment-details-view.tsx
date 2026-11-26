@@ -64,6 +64,16 @@ import type {
   CustomerCustomsJourney,
 } from "@/types";
 import type { ShipmentCustomsJourney } from "@/types/journey";
+import {
+  FINANCIAL_OBLIGATION_CLAIM_TYPE_LABELS,
+  FINANCIAL_OBLIGATION_STATUS_LABELS,
+  FINANCIAL_PAYMENT_METHOD_LABELS,
+  FINANCIAL_TRANSACTION_CATEGORY_LABELS,
+  FINANCIAL_TRANSACTION_TYPE_LABELS,
+  type CustomerCustomsObligationItem,
+  type CustomerShipmentFinancialStatementItem,
+  type ShipmentFinancialSummary,
+} from "@/types/financial";
 
 interface ShipmentDetailsViewProps {
   shipment: Shipment;
@@ -75,6 +85,9 @@ interface ShipmentDetailsViewProps {
   journey?: ShipmentCustomsJourney | null;
   customerJourney?: CustomerCustomsJourney | null;
   stageHistory?: ShipmentStageHistoryItem[];
+  financialSummary?: ShipmentFinancialSummary | null;
+  financialStatement?: CustomerShipmentFinancialStatementItem[];
+  customsObligations?: CustomerCustomsObligationItem[];
 }
 
 export function ShipmentDetailsView({
@@ -87,6 +100,9 @@ export function ShipmentDetailsView({
   journey = null,
   customerJourney = null,
   stageHistory = [],
+  financialSummary = null,
+  financialStatement = [],
+  customsObligations = [],
 }: ShipmentDetailsViewProps) {
   const router = useRouter();
   const [isPending, startTransition] = useTransition();
@@ -224,6 +240,7 @@ export function ShipmentDetailsView({
     acid: acidRecord,
     journey,
     customerJourney,
+    financialSummary,
     invoiceReviews,
     pricingHistory,
     isCustomerView: true,
@@ -256,17 +273,26 @@ export function ShipmentDetailsView({
 
   // Financial summary helper for customer
   const getCustomerPricingInfo = () => {
+    const isFinalApproved =
+      pricing?.status === "customer_approved" && pricing?.approval_type === "final_fixed";
+    const isRangeApprovedOnly =
+      pricing?.status === "customer_approved" && pricing?.approval_type === "estimated_range";
+
     if (pricing?.final_price) {
       return {
         main: `${pricing.final_price.toLocaleString("ar-EG")} ${pricing.currency || "EGP"}`,
-        sub: pricing.customer_approved_at ? "تم اعتماد السعر النهائي ✓" : "السعر النهائي محدد",
-        actionNeeded: !pricing.customer_approved_at,
+        sub: isFinalApproved
+          ? "تم اعتماد السعر النهائي ✓"
+          : "السعر النهائي بانتظار موافقتك",
+        actionNeeded: !isFinalApproved,
       };
     }
     if (pricing?.estimated_min_price && pricing?.estimated_max_price) {
       return {
         main: `${pricing.estimated_min_price.toLocaleString("ar-EG")} - ${pricing.estimated_max_price.toLocaleString("ar-EG")} ${pricing.currency || "EGP"}`,
-        sub: "تقدير تكلفة التخليص المبدئي",
+        sub: isRangeApprovedOnly
+          ? "تم اعتماد النطاق التقديري (بانتظار السعر النهائي)"
+          : "تقدير تكلفة التخليص المبدئي",
         actionNeeded: false,
       };
     }
@@ -894,7 +920,9 @@ export function ShipmentDetailsView({
                     : "لم يحدد بعد"}
                 </div>
                 <p className="text-xs text-neutral-500">
-                  {pricing?.customer_approved_at
+                  {pricing?.status === "customer_approved" &&
+                  pricing?.approval_type === "final_fixed" &&
+                  pricing?.customer_approved_at
                     ? `تم اعتمادك في: ${formatDateAr(pricing.customer_approved_at)}`
                     : pricing?.final_price
                     ? "بانتظار موافقتك"
@@ -943,17 +971,17 @@ export function ShipmentDetailsView({
             )}
 
             {/* Direct Customer Pricing Actions */}
-            {pricing?.status === "customer_approved" || pricing?.customer_approved_at ? (
+            {pricing?.status === "customer_approved" && pricing?.approval_type === "final_fixed" ? (
               <div className="p-5 rounded-2xl bg-emerald-50 border border-emerald-200 text-xs text-emerald-950 space-y-2">
                 <div className="flex items-center gap-2">
                   <DynamicIcon name="CheckCircle" className="w-5 h-5 text-emerald-600 shrink-0" />
-                  <strong className="text-sm font-bold">تمت الموافقة على التسعير بنجاح</strong>
+                  <strong className="text-sm font-bold">تمت الموافقة على السعر النهائي بنجاح</strong>
                 </div>
                 <p className="text-emerald-800">
-                  تم اعتماد التكلفة النهائية للتخليص الجمركي بمبلغ {pricing?.final_price?.toLocaleString("ar-EG") || pricing?.estimated_min_price?.toLocaleString("ar-EG")} {pricing?.currency || "EGP"}{pricing?.customer_approved_at ? ` بتاريخ ${formatDateAr(pricing.customer_approved_at)}` : ""}.
+                  تم اعتماد التكلفة النهائية لأتعاب التخليص الجمركي بمبلغ {pricing?.final_price?.toLocaleString("ar-EG")} {pricing?.currency || "EGP"}{pricing?.customer_approved_at ? ` بتاريخ ${formatDateAr(pricing.customer_approved_at)}` : ""}.
                 </p>
               </div>
-            ) : pricing?.final_price || shipment.status === "price_agreed" ? (
+            ) : pricing?.status === "final_proposed" || pricing?.final_price || shipment.status === "price_agreed" ? (
               /* State 2: Final Agreed Price Awaiting Customer Approval */
               <div className="p-5 rounded-2xl bg-blue-50/80 border border-blue-200 flex flex-col md:flex-row md:items-center justify-between gap-4">
                 <div className="flex items-start gap-3">
@@ -982,6 +1010,16 @@ export function ShipmentDetailsView({
                   <DynamicIcon name="Check" className="w-4 h-4" />
                   <span>{isPending ? "جاري الاعتماد..." : "اعتماد وموافقة على السعر النهائي"}</span>
                 </button>
+              </div>
+            ) : pricing?.status === "customer_approved" && pricing?.approval_type === "estimated_range" ? (
+              <div className="p-5 rounded-2xl bg-emerald-50 border border-emerald-200 text-xs text-emerald-950 space-y-2">
+                <div className="flex items-center gap-2">
+                  <DynamicIcon name="CheckCircle" className="w-5 h-5 text-emerald-600 shrink-0" />
+                  <strong className="text-sm font-bold">تمت الموافقة على النطاق التقديري المبدئي</strong>
+                </div>
+                <p className="text-emerald-800">
+                  النطاق المعتمد: {pricing.estimated_min_price.toLocaleString("ar-EG")} - {pricing.estimated_max_price.toLocaleString("ar-EG")} {pricing.currency || "EGP"}. سيتم إرسال السعر النهائي الثابت لاعتماده قبل مرحلة التسوية المالية.
+                </p>
               </div>
             ) : pricing?.status === "negotiation_requested" || shipment.status === "negotiation" ? (
               /* State 3: Negotiation Requested */
@@ -1036,6 +1074,232 @@ export function ShipmentDetailsView({
                 </div>
               </div>
             ) : null}
+
+            {/* Live Financial Ledger Breakdown (Migration 0019 Customer View — Track A & Track B) */}
+            {(financialSummary || customsObligations.length > 0 || financialStatement.length > 0) && (
+              <div className="border-t border-neutral-200/80 pt-6 space-y-5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <h4 className="text-sm font-black text-neutral-950 flex items-center gap-2">
+                      <DynamicIcon name="CreditCard" className="w-4 h-4 text-[#F5C500]" />
+                      <span>كشف المستحقات المالية والرسوم الجمركية</span>
+                    </h4>
+                    <p className="text-xs text-neutral-500 mt-0.5">
+                      بيان تفصيلي معتمد للرسوم الجمركية الرسمية وحساب شركة OUT بناءً على القيود المؤكدة
+                    </p>
+                  </div>
+                  {financialSummary && (
+                    <span
+                      className={`text-[11px] font-bold px-3 py-1 rounded-full border ${
+                        financialSummary.is_financial_settlement_complete
+                          ? "bg-emerald-50 text-emerald-800 border-emerald-200"
+                          : "bg-yellow-50 text-neutral-900 border-yellow-300"
+                      }`}
+                    >
+                      {financialSummary.is_financial_settlement_complete
+                        ? "التسوية المالية مكتملة ✓"
+                        : "التسوية المالية جارية"}
+                    </span>
+                  )}
+                </div>
+
+                {financialSummary && (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    {/* Track A: Official Customs Obligations */}
+                    <div className="p-5 rounded-2xl bg-neutral-50 border border-neutral-200/90 space-y-3">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-black text-neutral-900">أولاً: المطالبات والرسوم الجمركية</span>
+                        <span
+                          className={`text-[10px] font-bold px-2 py-0.5 rounded border ${
+                            financialSummary.is_customs_coverage_complete
+                              ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+                              : "bg-amber-50 text-amber-800 border-amber-200"
+                          }`}
+                        >
+                          {financialSummary.is_customs_coverage_complete ? "مغطاة بالكامل" : "قيد التسوية"}
+                        </span>
+                      </div>
+                      <div className="space-y-1.5 text-xs">
+                        <div className="flex justify-between">
+                          <span className="text-neutral-600">إجمالي المطالبات الجمركية المقررة</span>
+                          <strong className="font-mono text-neutral-950">
+                            {financialSummary.assessed_customs_obligation.toLocaleString("ar-EG")} ج.م
+                          </strong>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-neutral-600">سداد مباشر من العميل للجمارك</span>
+                          <strong className="font-mono text-neutral-950">
+                            {financialSummary.verified_direct_customs_payments.toLocaleString("ar-EG")} ج.م
+                          </strong>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-neutral-600">سداد جمركي عبر شركة OUT</span>
+                          <strong className="font-mono text-neutral-950">
+                            {financialSummary.out_customs_disbursements.toLocaleString("ar-EG")} ج.م
+                          </strong>
+                        </div>
+                        {financialSummary.pending_direct_customs_payments > 0 && (
+                          <div className="flex justify-between text-amber-800">
+                            <span>إشعارات سداد مباشر بانتظار التحقق</span>
+                            <strong className="font-mono">
+                              {financialSummary.pending_direct_customs_payments.toLocaleString("ar-EG")} ج.م
+                            </strong>
+                          </div>
+                        )}
+                        <div className="flex justify-between pt-2 border-t border-neutral-200 font-bold">
+                          <span className="text-neutral-900">المتبقي على المطالبات الجمركية</span>
+                          <span className="font-mono text-neutral-950">
+                            {financialSummary.remaining_customs_obligation.toLocaleString("ar-EG")} ج.م
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Track B: OUT Receivable & Collections */}
+                    <div className="p-5 rounded-2xl bg-neutral-950 text-white border border-neutral-900 space-y-3">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-black text-[#F5C500]">ثانياً: مستحقات شركة OUT والتحصيل</span>
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-neutral-800 text-neutral-200 border border-neutral-700">
+                          {financialSummary.outstanding_balance_to_out === 0
+                            ? "مسوى بالكامل"
+                            : financialSummary.outstanding_balance_to_out < 0
+                            ? "رصيد دائن زائد"
+                            : "مستحق التحصيل"}
+                        </span>
+                      </div>
+                      <div className="space-y-1.5 text-xs">
+                        <div className="flex justify-between">
+                          <span className="text-neutral-300">أتعاب التخليص (من السعر النهائي المعتمد)</span>
+                          <strong className="font-mono text-white">
+                            {financialSummary.confirmed_out_service_fee.toLocaleString("ar-EG")} ج.م
+                          </strong>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-neutral-300">مصروفات ورسوم إضافية محمّلة</span>
+                          <strong className="font-mono text-white">
+                            {(
+                              financialSummary.billable_out_disbursements +
+                              financialSummary.other_approved_customer_charges
+                            ).toLocaleString("ar-EG")}{" "}
+                            ج.م
+                          </strong>
+                        </div>
+                        {financialSummary.approved_credits > 0 && (
+                          <div className="flex justify-between text-emerald-300">
+                            <span>خصومات وتسويات دائنة</span>
+                            <strong className="font-mono">
+                              -{financialSummary.approved_credits.toLocaleString("ar-EG")} ج.م
+                            </strong>
+                          </div>
+                        )}
+                        <div className="flex justify-between">
+                          <span className="text-neutral-300">إجمالي المستحق لشركة OUT</span>
+                          <strong className="font-mono text-white">
+                            {financialSummary.total_customer_receivable_to_out.toLocaleString("ar-EG")} ج.م
+                          </strong>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-neutral-300">إجمالي المدفوع لشركة OUT</span>
+                          <strong className="font-mono text-emerald-300">
+                            {financialSummary.total_received_by_out.toLocaleString("ar-EG")} ج.م
+                          </strong>
+                        </div>
+                        <div className="flex justify-between pt-2 border-t border-neutral-800 font-black">
+                          <span className="text-[#F5C500]">الرصيد المتبقي لشركة OUT</span>
+                          <span className="font-mono text-[#F5C500]">
+                            {financialSummary.outstanding_balance_to_out.toLocaleString("ar-EG")} ج.م
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Customs Obligations List */}
+                {customsObligations.length > 0 && (
+                  <div className="space-y-2.5">
+                    <h5 className="text-xs font-bold text-neutral-800">تفاصيل المطالبات الجمركية</h5>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      {customsObligations.map((ob) => (
+                        <div
+                          key={ob.id}
+                          className="p-3.5 rounded-xl bg-white border border-neutral-200 flex items-center justify-between gap-3 text-xs"
+                        >
+                          <div className="min-w-0">
+                            <div className="font-bold text-neutral-900 truncate">
+                              {FINANCIAL_OBLIGATION_CLAIM_TYPE_LABELS[ob.claim_type] || ob.claim_type}
+                            </div>
+                            <div className="text-[11px] text-neutral-500 mt-0.5">
+                              {ob.customs_claim_number ? `مرجع: ${ob.customs_claim_number} • ` : ""}
+                              {formatDateAr(ob.assessed_at)}
+                            </div>
+                          </div>
+                          <div className="text-left shrink-0">
+                            <div className="font-mono font-black text-neutral-950">
+                              {ob.assessed_amount.toLocaleString("ar-EG")} {ob.currency || "EGP"}
+                            </div>
+                            <span className="text-[10px] font-bold text-neutral-600">
+                              {FINANCIAL_OBLIGATION_STATUS_LABELS[ob.status] || ob.status}
+                            </span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Customer-Safe Financial Ledger Statement */}
+                {financialStatement.length > 0 && (
+                  <div className="space-y-2.5">
+                    <h5 className="text-xs font-bold text-neutral-800">سجل الحركات المالية المعتمدة</h5>
+                    <div className="space-y-2">
+                      {financialStatement.map((tx) => (
+                        <div
+                          key={tx.transaction_id}
+                          className="p-3.5 rounded-xl bg-white border border-neutral-200/90 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs"
+                        >
+                          <div className="space-y-0.5 min-w-0">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="font-bold text-neutral-900">
+                                {FINANCIAL_TRANSACTION_CATEGORY_LABELS[tx.entry_category] || tx.entry_category}
+                              </span>
+                              <span className="text-[10px] px-2 py-0.5 rounded bg-neutral-100 text-neutral-700 border border-neutral-200">
+                                {FINANCIAL_TRANSACTION_TYPE_LABELS[tx.entry_type] || tx.entry_type}
+                              </span>
+                              {tx.direction === -1 && (
+                                <span className="text-[10px] px-2 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-200 font-bold">
+                                  قيد عكسي
+                                </span>
+                              )}
+                            </div>
+                            <div className="text-[11px] text-neutral-500">
+                              {tx.payment_method
+                                ? `${FINANCIAL_PAYMENT_METHOD_LABELS[tx.payment_method] || tx.payment_method} • `
+                                : ""}
+                              {tx.reference_number ? `مرجع: ${tx.reference_number} • ` : ""}
+                              {formatDateAr(tx.transaction_date)}
+                            </div>
+                            {tx.description && (
+                              <p className="text-[11px] text-neutral-600">{tx.description}</p>
+                            )}
+                          </div>
+                          <div className="text-left shrink-0">
+                            <span
+                              className={`font-mono font-black text-sm ${
+                                tx.direction === -1 ? "text-amber-700" : "text-neutral-950"
+                              }`}
+                            >
+                              {tx.direction === -1 ? "-" : ""}
+                              {tx.amount.toLocaleString("ar-EG")} {tx.currency || "EGP"}
+                            </span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         )}
 
@@ -1144,6 +1408,9 @@ export function ShipmentDetailsView({
           documents={documents}
           pricing={pricing}
           acid={acidRecord}
+          financialSummary={financialSummary}
+          financialStatement={financialStatement}
+          customsObligations={customsObligations}
           onPreviewDocument={(doc) => setPreviewDoc(doc)}
           onActionClick={(tab) => {
             setSelectedStation(null);

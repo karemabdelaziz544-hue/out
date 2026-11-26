@@ -688,6 +688,7 @@ export function evaluateStage9FinancialGate(
         | "assessed_customs_obligation"
         | "pending_direct_customs_payments"
         | "remaining_customs_obligation"
+        | "total_customer_receivable_to_out"
       >
     >,
 ): Stage9FinancialGateEvaluation {
@@ -698,6 +699,12 @@ export function evaluateStage9FinancialGate(
   const outstandingPiastres = toPiastres(summary.outstanding_balance_to_out, {
     fieldName: "outstanding_balance_to_out",
   });
+  const totalReceivablePiastres =
+    summary.total_customer_receivable_to_out !== undefined
+      ? toPiastres(summary.total_customer_receivable_to_out, {
+          fieldName: "total_customer_receivable_to_out",
+        })
+      : 0;
   const assessedPiastres =
     summary.assessed_customs_obligation !== undefined
       ? toPiastres(summary.assessed_customs_obligation, {
@@ -713,7 +720,10 @@ export function evaluateStage9FinancialGate(
         })
       : 0;
 
-  const isOutReceivableSettled = hasConfirmedFinalPrice && outstandingPiastres === 0;
+  const isOutReceivableSettled =
+    hasConfirmedFinalPrice &&
+    totalReceivablePiastres >= 0 &&
+    outstandingPiastres === 0;
 
   if (!hasConfirmedFinalPrice) {
     blockingReasons.push({
@@ -746,7 +756,12 @@ export function evaluateStage9FinancialGate(
     });
   }
 
-  if (outstandingPiastres > 0) {
+  if (totalReceivablePiastres < 0) {
+    blockingReasons.push({
+      code: "overpayment_unsettled",
+      message: `صافي مستحقات العميل سالب (${fromPiastres(totalReceivablePiastres)} ج.م) نتيجة خصومات أو تسويات دائنة؛ يرجى مراجعة القيود قبل إغلاق المرحلة المالية.`,
+    });
+  } else if (outstandingPiastres > 0) {
     blockingReasons.push({
       code: "outstanding_balance_unpaid",
       message:

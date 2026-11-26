@@ -302,6 +302,23 @@ export interface ShipmentCustomsObligation
 }
 
 /**
+ * Customer-safe projection of a shipment customs obligation.
+ * Strictly strips internal staff notes and audit user IDs (`notes`, `created_by`, `updated_by`).
+ */
+export interface CustomerCustomsObligationItem {
+  id: string;
+  shipment_id: string;
+  claim_type: FinancialObligationClaimType;
+  customs_claim_number: string | null;
+  assessed_amount: number;
+  currency: FinancialCurrency;
+  status: FinancialObligationStatus;
+  assessed_at: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
  * Raw row from `public.shipment_financial_transactions`.
  * Note: `amount` and `allocated_customs_amount` are `numeric(14,2)` in PostgreSQL
  * and may arrive as `number | string`.

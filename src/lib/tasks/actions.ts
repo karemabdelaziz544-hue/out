@@ -15,7 +15,7 @@ import type { JourneyActionResult } from "@/lib/shipments/journey-actions";
 export async function updateTaskStatusAction(
   formData: FormData,
 ): Promise<JourneyActionResult> {
-  await requireRole(["admin", "manager", "data_entry", "scout", "inspector"]);
+  await requireRole(["admin", "data_entry", "scout", "inspector"]);
 
   const shipmentId = formData.get("shipment_id")?.toString();
 
