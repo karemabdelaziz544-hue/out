@@ -42,11 +42,25 @@ export async function proxy(request: NextRequest) {
     request,
   });
 
-  // Always refresh the session — required by @supabase/ssr
-  const supabase = createMiddlewareClient(request, response);
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  let user = null;
+
+  if (
+    process.env.NEXT_PUBLIC_SUPABASE_URL &&
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+  ) {
+    try {
+      // Always refresh the session — required by @supabase/ssr
+      const supabase = createMiddlewareClient(request, response);
+      const { data } = await supabase.auth.getUser();
+      user = data.user;
+    } catch (error) {
+      console.error("[proxy] Failed to refresh Supabase session:", error);
+    }
+  } else {
+    console.error(
+      "[proxy] Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_ANON_KEY environment variables.",
+    );
+  }
 
   const pathname = request.nextUrl.pathname;
 
