@@ -14,6 +14,7 @@
  */
 
 import type { TrackingResult, TrackingLookupRequest, OutClearanceSummary } from "./types";
+import type { ShipmentAcidRow, ShipmentRow } from "@/types/database";
 import type { TrackingProviderAdapter } from "./providers/tracking-adapter";
 import { SearatesProvider } from "./providers/searates-provider";
 import { MockProvider } from "./providers/mock-provider";
@@ -234,6 +235,46 @@ async function getSupabaseForTracking() {
   }
 }
 
+type PublicShipmentRow = Pick<
+  ShipmentRow,
+  | "id"
+  | "reference_number"
+  | "status"
+  | "port_of_arrival"
+  | "country_of_origin"
+  | "goods_description"
+  | "goods_category"
+>;
+
+type AcidLookupRow = Pick<
+  ShipmentAcidRow,
+  "id" | "shipment_id" | "acid_number" | "status"
+>;
+
+type TrackingSupabaseClient = NonNullable<
+  Awaited<ReturnType<typeof getSupabaseForTracking>>
+>;
+
+async function fetchPublicShipment(
+  supabase: TrackingSupabaseClient,
+  column: "reference_number" | "id",
+  value: string,
+): Promise<{ data: PublicShipmentRow | null; error: unknown }> {
+  // Query only public-safe fields — NEVER expose customer details
+  const result = (await supabase
+    .from("shipments")
+    .select(
+      "id, reference_number, status, port_of_arrival, country_of_origin, goods_description, goods_category",
+    )
+    .eq(column, value)
+    .maybeSingle()) as unknown as {
+    data: PublicShipmentRow | null;
+    error: unknown;
+  };
+
+  return result;
+}
+
 /**
  * Lookup OUT internal reference.
  * Returns ONLY public-safe information. Never exposes customer details.
@@ -254,12 +295,11 @@ async function lookupOutReference(refNumber: string): Promise<TrackingResult> {
       };
     }
 
-    // Query only public-safe fields — NEVER expose customer details
-    const { data: shipment, error } = await supabase
-      .from("shipments")
-      .select("id, reference_number, status, port_of_arrival, country_of_origin, goods_description, goods_category")
-      .eq("reference_number", refNumber)
-      .maybeSingle();
+    const { data: shipment, error } = await fetchPublicShipment(
+      supabase,
+      "reference_number",
+      refNumber,
+    );
 
     if (error || !shipment) {
       return {
@@ -322,11 +362,14 @@ async function lookupAcidNumber(acidNumber: string): Promise<TrackingResult> {
     }
 
     // Look up the ACID in shipment_acids table
-    const { data: acidRecord, error } = await supabase
+    const { data: acidRecord, error } = (await supabase
       .from("shipment_acids")
       .select("id, shipment_id, acid_number, status")
       .eq("acid_number", acidNumber)
-      .maybeSingle();
+      .maybeSingle()) as unknown as {
+      data: AcidLookupRow | null;
+      error: unknown;
+    };
 
     if (error || !acidRecord) {
       return {
@@ -342,11 +385,11 @@ async function lookupAcidNumber(acidNumber: string): Promise<TrackingResult> {
     }
 
     // Fetch public-safe shipment info
-    const { data: shipment } = await supabase
-      .from("shipments")
-      .select("id, reference_number, status, port_of_arrival, country_of_origin, goods_description, goods_category")
-      .eq("id", acidRecord.shipment_id)
-      .maybeSingle();
+    const { data: shipment } = await fetchPublicShipment(
+      supabase,
+      "id",
+      acidRecord.shipment_id,
+    );
 
     const summary = shipment ? buildPublicClearanceSummary(shipment) : undefined;
 
@@ -394,7 +437,7 @@ function sanitizeInput(input: string): string | null {
  * NEVER includes: customer name, company, pricing, fees, documents, notes.
  */
 function buildPublicClearanceSummary(
-  shipment: Record<string, unknown>,
+  shipment: PublicShipmentRow,
 ): OutClearanceSummary {
   const status = String(shipment.status || "draft");
 
