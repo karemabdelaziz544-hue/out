@@ -144,7 +144,8 @@ CREATE POLICY "shipment_ext_ops_insert_staff"
     AND EXISTS (
       SELECT 1 FROM public.profiles
       WHERE id = auth.uid()
-        AND status = 'active'
+        AND is_active = true
+        AND COALESCE(provisioning_status, 'active') = 'active'
         AND role IN ('admin', 'data_entry', 'inspector')
     )
   );
@@ -157,7 +158,8 @@ CREATE POLICY "shipment_ext_ops_update_staff"
     EXISTS (
       SELECT 1 FROM public.profiles
       WHERE id = auth.uid()
-        AND status = 'active'
+        AND is_active = true
+        AND COALESCE(provisioning_status, 'active') = 'active'
         AND role IN ('admin', 'data_entry', 'inspector')
     )
   )
@@ -165,7 +167,8 @@ CREATE POLICY "shipment_ext_ops_update_staff"
     EXISTS (
       SELECT 1 FROM public.profiles
       WHERE id = auth.uid()
-        AND status = 'active'
+        AND is_active = true
+        AND COALESCE(provisioning_status, 'active') = 'active'
         AND role IN ('admin', 'data_entry', 'inspector')
     )
   );
